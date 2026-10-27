@@ -29,7 +29,7 @@ portal/
 ├── home.py             # página inicial e navegação
 ├── tema.py             # tema visual compartilhado (topo, cores, selos)
 ├── logo_tag.png
-├── iniciar.bat         # cria o ambiente e inicia o portal
+├── iniciar.py      # cria o ambiente e inicia o portal
 ├── requirements.txt
 └── apps/
     ├── extratos/       # Solicitação de extratos
@@ -40,7 +40,7 @@ portal/
 
 Pré-requisitos: **Windows**, **Python 3.12** e **Outlook** instalado e aberto (para a ferramenta de extratos). Na Mesa de Boletas, a importação automática precisa de acesso ao boletador da TAG.
 
-Dê dois cliques em `portal/iniciar.bat`. Na primeira vez, ele cria o ambiente virtual, instala as dependências e o Chromium do Playwright. Depois, inicia o portal no navegador.
+Dê dois cliques em `portal/iniciar.py`. Na primeira vez, ele cria o ambiente virtual, instala as dependências e o Chromium do Playwright. Depois, inicia o portal no navegador.
 
 Ou, manualmente, dentro de `portal/`:
 
