@@ -1,0 +1,26 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+.env.*
+*.log
+.streamlit/secrets.toml
+.claude/
+
+# Britech: segredos e arquivos gerados pela busca na API
+portal/apps/britech/.env
+portal/apps/britech/Relatorio_Rentabilidade.xlsx
+portal/apps/britech/Rentabilidade_Tratada.xlsx
+portal/apps/britech/Historico_Cotas.csv
+portal/apps/britech/extratos/
+portal/apps/britech/Monitor_Cotas_*.xlsx
+
+# Dados reais e apoio local — não versionar (padrões TAG)
+docs/*.pdf
+portal/apps/**/*.pdf
+portal/apps/boletador/controle_erros*.json
+portal/apps/boletador/backups_erros/
+portal/apps/boletador/snapshot_ata.json
+portal/apps/britech/ids_cliente.xlsx
+portal/apps/extratos/Extratos/
+portal/apps/extratos/*-bkp.xlsx
