@@ -24,3 +24,7 @@ portal/apps/boletador/snapshot_ata.json
 portal/apps/britech/ids_cliente.xlsx
 portal/apps/extratos/Extratos/
 portal/apps/extratos/*-bkp.xlsx
+
+# Ambiente de rede: segredos e dados reais
+portal/env/
+portal/dados/

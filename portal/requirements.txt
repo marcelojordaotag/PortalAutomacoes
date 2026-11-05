@@ -1,23 +1,34 @@
-# Interface
-streamlit>=1.37
+# Dados
+pandas==1.5.3
+numpy==1.24.1
 
-# Dados e gráficos
-pandas>=2.2
-numpy>=1.26
-plotly>=5.20
-altair>=5.0
+# Configuração
+python-decouple==3.8
 
-# Leitura de planilhas e PDFs (usadas pelo pandas e pelo app de extratos)
-openpyxl>=3.1
-xlrd>=2.0
-pypdf>=4.0
+# AWS (Parameter Store)
+boto3==1.34.162
+
+# HTTP
+requests==2.32.3
+urllib3==1.26.15
+
+# Excel / planilhas
+openpyxl==3.1.5
+xlrd==2.0.1
+
+# Leitura de PDFs
+pypdf==5.1.0
+pdfplumber==0.11.4
+
+# Dashboard
+streamlit==1.43.0
+pyarrow==17.0.0
+plotly==5.24.1
+altair==5.5.0
 
 # Monitoramento de pastas
-watchdog>=4.0
-
-# API Britech
-requests>=2.31
+watchdog==6.0.0
 
 # Automação (somente Windows)
-pywin32>=306; sys_platform == "win32"
-playwright>=1.44
+pywin32==308; sys_platform == "win32"
+playwright==1.49.1
