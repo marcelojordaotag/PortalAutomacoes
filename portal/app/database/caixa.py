@@ -14,7 +14,7 @@ FORMATOS_DATA = ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%d/%m/%Y %H:%M:%S", 
 
 def listarCategorias():
     """Categorias de OBS na ordem salva (lista vazia se a tabela estiver vazia)."""
-    lista_linhas = consultarTodos("SELECT nm_categoria FROM tb_caixa_categoria ORDER BY nr_ordem")
+    lista_linhas = consultarTodos("SELECT nm_categoria FROM portal_tb_caixa_categoria ORDER BY nr_ordem")
     return [linha["nm_categoria"] for linha in lista_linhas]
 
 
@@ -22,9 +22,9 @@ def gravarCategorias(lista_categorias):
     """Substitui a lista inteira, preservando a ordem."""
     lista_unica = list(dict.fromkeys(str(nm_categoria).strip() for nm_categoria in lista_categorias if str(nm_categoria).strip()))
     with abrirTransacao() as cursor:
-        cursor.execute("DELETE FROM tb_caixa_categoria")
+        cursor.execute("DELETE FROM portal_tb_caixa_categoria")
         if lista_unica:
-            cursor.executemany("INSERT INTO tb_caixa_categoria (nm_categoria, nr_ordem) VALUES (%s,%s)",
+            cursor.executemany("INSERT INTO portal_tb_caixa_categoria (nm_categoria, nr_ordem) VALUES (%s,%s)",
                                [(nm_categoria, nr_ordem) for nr_ordem, nm_categoria in enumerate(lista_unica)])
 
 
@@ -36,7 +36,7 @@ def nomePlanilha(nm_arquivo):
 def lerEstado(nm_arquivo):
     """{id_carteira: {obs, status, comentario}} da planilha."""
     lista_linhas = consultarTodos(
-        "SELECT id_carteira, ds_obs, nm_status, ds_comentario FROM tb_caixa_estado WHERE nm_planilha = %s", (nomePlanilha(nm_arquivo),))
+        "SELECT id_carteira, ds_obs, nm_status, ds_comentario FROM portal_tb_caixa_estado WHERE nm_planilha = %s", (nomePlanilha(nm_arquivo),))
     return {linha["id_carteira"]: {"obs": linha["ds_obs"] or "", "status": linha["nm_status"] or "", "comentario": linha["ds_comentario"] or ""}
             for linha in lista_linhas}
 
@@ -47,15 +47,15 @@ def gravarEstado(nm_arquivo, dict_estado):
     with abrirTransacao() as cursor:
         if dict_estado:
             lista_ids = [str(id_carteira) for id_carteira in dict_estado]
-            cursor.execute(f"DELETE FROM tb_caixa_estado WHERE nm_planilha = %s AND id_carteira NOT IN ({','.join(['%s'] * len(lista_ids))})",
+            cursor.execute(f"DELETE FROM portal_tb_caixa_estado WHERE nm_planilha = %s AND id_carteira NOT IN ({','.join(['%s'] * len(lista_ids))})",
                            [nm_planilha] + lista_ids)
             cursor.executemany(
-                """INSERT INTO tb_caixa_estado (nm_planilha, id_carteira, ds_obs, nm_status, ds_comentario) VALUES (%s,%s,%s,%s,%s)
+                """INSERT INTO portal_tb_caixa_estado (nm_planilha, id_carteira, ds_obs, nm_status, ds_comentario) VALUES (%s,%s,%s,%s,%s)
                    ON DUPLICATE KEY UPDATE ds_obs = VALUES(ds_obs), nm_status = VALUES(nm_status), ds_comentario = VALUES(ds_comentario)""",
                 [(nm_planilha, str(id_carteira), estado.get("obs", ""), estado.get("status", ""), estado.get("comentario", ""))
                  for id_carteira, estado in dict_estado.items()])
         else:
-            cursor.execute("DELETE FROM tb_caixa_estado WHERE nm_planilha = %s", (nm_planilha,))
+            cursor.execute("DELETE FROM portal_tb_caixa_estado WHERE nm_planilha = %s", (nm_planilha,))
 
 
 def lerData(tx_data):
@@ -71,7 +71,7 @@ def lerData(tx_data):
 
 def listarMonitor():
     """Lista de e-mails do monitor (dicts como no JSON antigo), do mais novo para o mais antigo."""
-    lista_linhas = consultarTodos("SELECT * FROM tb_caixa_monitor_email ORDER BY dt_criado DESC, id_monitor DESC")
+    lista_linhas = consultarTodos("SELECT * FROM portal_tb_caixa_monitor_email ORDER BY dt_criado DESC, id_monitor DESC")
     lista_monitor = []
     for linha in lista_linhas:
         registro = {nm_chave: linha[nm_coluna] for nm_chave, nm_coluna in CAMPOS_MONITOR if linha[nm_coluna] is not None}
@@ -99,7 +99,7 @@ def gravarMonitor(lista_monitor):
         return
     with abrirTransacao() as cursor:
         cursor.executemany(
-            """INSERT INTO tb_caixa_monitor_email (ds_token, nm_imagem, nm_status, qt_prazo_horas, dt_criado, dt_enviado,
+            """INSERT INTO portal_tb_caixa_monitor_email (ds_token, nm_imagem, nm_status, qt_prazo_horas, dt_criado, dt_enviado,
                ds_topico, ds_assunto, ds_para, nm_respondido_por, dt_respondido, ds_entry_id, ds_corpo, ds_nota_anexos,
                nm_slack, ds_alerta_prazo) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                ON DUPLICATE KEY UPDATE nm_imagem = VALUES(nm_imagem), nm_status = VALUES(nm_status), qt_prazo_horas = VALUES(qt_prazo_horas),
@@ -114,4 +114,4 @@ def removerMonitor(lista_tokens):
     if not lista_tokens:
         return
     with abrirTransacao() as cursor:
-        cursor.executemany("DELETE FROM tb_caixa_monitor_email WHERE ds_token = %s", [(ds_token,) for ds_token in lista_tokens])
+        cursor.executemany("DELETE FROM portal_tb_caixa_monitor_email WHERE ds_token = %s", [(ds_token,) for ds_token in lista_tokens])

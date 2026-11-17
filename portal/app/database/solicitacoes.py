@@ -1,4 +1,4 @@
-"""Acesso ao banco das Solicitações (tb_solicitacao, tb_solicitacao_historico, tb_solicitacao_complemento, tb_cliente).
+"""Acesso ao banco das Solicitações (portal_tb_solicitacao, portal_tb_solicitacao_historico, portal_tb_solicitacao_complemento, portal_tb_cliente).
 
 Devolve e recebe os mesmos dicionários que as páginas já usavam no solicitacoes.json (chaves em português,
 datas como texto 'AAAA-MM-DD' e histórico com 'quando' em 'AAAA-MM-DD HH:MM'). As evidências continuam em disco:
@@ -13,7 +13,7 @@ from app.database.db import abrirTransacao, consultarTodos
 PASTA_EVIDENCIAS = obterDiretorioDados("solicitacoes") / "evidencias"
 FORMATO_QUANDO = "%Y-%m-%d %H:%M"
 
-# chave da página -> coluna de tb_solicitacao
+# chave da página -> coluna de portal_tb_solicitacao
 COLUNAS = {
     "cliente": "ds_cliente", "solicitante": "nm_solicitante", "data": "dt_solicitacao", "tipo": "nm_tipo",
     "descricao": "ds_descricao", "status": "nm_status", "data_conclusao": "dt_conclusao", "evidencia": "nm_evidencia",
@@ -21,7 +21,7 @@ COLUNAS = {
 }
 CHAVES_DATA = ("data", "data_conclusao", "sla_data")
 CHAVES_OPCIONAIS = ("prioridade", "registrado_por", "competencia", "sla_data")  # ausentes nos registros antigos
-# chave da página -> coluna de tb_solicitacao_complemento
+# chave da página -> coluna de portal_tb_solicitacao_complemento
 COLUNAS_COMPLEMENTO = {"resolucao": "ds_resolucao", "email_solicitante": "ds_email_solicitante"}
 
 
@@ -83,18 +83,18 @@ def montarRegistro(linha, lista_historico, linha_complemento):
 # ---------------------------------------------------------------- leitura
 def listarSolicitacoes():
     """Todas as solicitações (ordem do id) com o histórico aninhado. Erro de banco sobe como exceção."""
-    lista_linhas = consultarTodos("SELECT * FROM tb_solicitacao ORDER BY id_solicitacao")
+    lista_linhas = consultarTodos("SELECT * FROM portal_tb_solicitacao ORDER BY id_solicitacao")
     dic_historico, dic_complemento = {}, {}
-    for historico in consultarTodos("SELECT * FROM tb_solicitacao_historico ORDER BY id_solicitacao, id_historico"):
+    for historico in consultarTodos("SELECT * FROM portal_tb_solicitacao_historico ORDER BY id_solicitacao, id_historico"):
         dic_historico.setdefault(historico["id_solicitacao"], []).append(historico)
-    for complemento in consultarTodos("SELECT * FROM tb_solicitacao_complemento"):
+    for complemento in consultarTodos("SELECT * FROM portal_tb_solicitacao_complemento"):
         dic_complemento[complemento["id_solicitacao"]] = complemento
     return [montarRegistro(linha, dic_historico.get(linha["id_solicitacao"], []), dic_complemento.get(linha["id_solicitacao"]))
             for linha in lista_linhas]
 
 
 def listarClientes():
-    return [linha["ds_cliente"] for linha in consultarTodos("SELECT ds_cliente FROM tb_cliente ORDER BY id_cliente")]
+    return [linha["ds_cliente"] for linha in consultarTodos("SELECT ds_cliente FROM portal_tb_cliente ORDER BY id_cliente")]
 
 
 # ---------------------------------------------------------------- gravação por registro
@@ -105,7 +105,7 @@ def inserirEventos(cursor, registro):
             continue
         dt_evento = datetime.strptime(evento["quando"], FORMATO_QUANDO) if evento.get("quando") else None
         cursor.execute(
-            "INSERT INTO tb_solicitacao_historico (id_solicitacao, dt_evento, nm_evento, ds_detalhe, nm_usuario) VALUES (%s,%s,%s,%s,%s)",
+            "INSERT INTO portal_tb_solicitacao_historico (id_solicitacao, dt_evento, nm_evento, ds_detalhe, nm_usuario) VALUES (%s,%s,%s,%s,%s)",
             (registro["id"], dt_evento, evento.get("evento"), evento.get("detalhe"), evento.get("usuario") or None))
         evento["id_historico"] = cursor.lastrowid
 
@@ -116,7 +116,7 @@ def gravarComplemento(cursor, registro, lista_chaves):
     dic_valores = {COLUNAS_COMPLEMENTO[chave]: valorParaBanco(chave, registro.get(chave)) for chave in lista_chaves}
     nm_colunas = list(dic_valores)
     cursor.execute(
-        f"INSERT INTO tb_solicitacao_complemento (id_solicitacao, {', '.join(nm_colunas)}) VALUES (%s, {', '.join(['%s'] * len(nm_colunas))}) "
+        f"INSERT INTO portal_tb_solicitacao_complemento (id_solicitacao, {', '.join(nm_colunas)}) VALUES (%s, {', '.join(['%s'] * len(nm_colunas))}) "
         f"ON DUPLICATE KEY UPDATE {', '.join(f'{nm_coluna}=VALUES({nm_coluna})' for nm_coluna in nm_colunas)}",
         (registro["id"], *dic_valores.values()))
 
@@ -126,7 +126,7 @@ def criarSolicitacao(registro):
     lista_chaves = [chave for chave in COLUNAS if chave in registro]
     with abrirTransacao() as cursor:
         cursor.execute(
-            f"INSERT INTO tb_solicitacao ({', '.join(COLUNAS[chave] for chave in lista_chaves)}) VALUES ({', '.join(['%s'] * len(lista_chaves))})",
+            f"INSERT INTO portal_tb_solicitacao ({', '.join(COLUNAS[chave] for chave in lista_chaves)}) VALUES ({', '.join(['%s'] * len(lista_chaves))})",
             [valorParaBanco(chave, registro[chave]) for chave in lista_chaves])
         registro["id"] = cursor.lastrowid
         inserirEventos(cursor, registro)
@@ -146,7 +146,7 @@ def salvarSolicitacoes(lista_registros):
             mudados = [chave for chave in COLUNAS if normalizarValor(chave, registro.get(chave)) != dic_orig.get(chave)]
             if mudados:
                 cursor.execute(
-                    f"UPDATE tb_solicitacao SET {', '.join(COLUNAS[chave] + '=%s' for chave in mudados)} WHERE id_solicitacao=%s",
+                    f"UPDATE portal_tb_solicitacao SET {', '.join(COLUNAS[chave] + '=%s' for chave in mudados)} WHERE id_solicitacao=%s",
                     [valorParaBanco(chave, registro.get(chave)) for chave in mudados] + [registro["id"]])
             gravarComplemento(cursor, registro, [chave for chave in COLUNAS_COMPLEMENTO
                                                  if normalizarValor(chave, registro.get(chave)) != dic_orig.get(chave)])
@@ -162,4 +162,4 @@ def salvarSolicitacao(registro):
 def excluirSolicitacao(id_solicitacao):
     """Remove a solicitação (histórico e complemento vão junto por ON DELETE CASCADE)."""
     with abrirTransacao() as cursor:
-        cursor.execute("DELETE FROM tb_solicitacao WHERE id_solicitacao=%s", (id_solicitacao,))
+        cursor.execute("DELETE FROM portal_tb_solicitacao WHERE id_solicitacao=%s", (id_solicitacao,))

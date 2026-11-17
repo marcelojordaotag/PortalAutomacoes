@@ -1,6 +1,6 @@
 """Log breve de acessos e uso das ferramentas, com retenção de 7 dias (só administradores veem, na página Acessos e uso).
 
-- Um evento por linha na tabela tb_acesso_log (banco MySQL).
+- Um evento por linha na tabela portal_tb_acesso_log (banco MySQL).
 - Nunca grava senha. Login de quem não existe não é guardado, para não registrar uma senha digitada no campo errado.
 - O log nunca derruba o portal: qualquer falha de gravação é ignorada.
 """

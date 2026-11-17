@@ -25,7 +25,7 @@ st.set_page_config(
 
 def seloExtratos():
     try:
-        qt_linhas = consultarUm("SELECT COUNT(*) AS qt FROM tb_extratos_fundo_cotista")["qt"]
+        qt_linhas = consultarUm("SELECT COUNT(*) AS qt FROM portal_tb_extratos_fundo_cotista")["qt"]
     except Exception:  # noqa: BLE001  (o selo da home nunca derruba a página)
         return '<span class="badge warn">BANCO INDISPONÍVEL</span>'
     if not qt_linhas:
@@ -35,7 +35,7 @@ def seloExtratos():
 
 def seloSolicitacoes():
     try:
-        qt_pendentes = consultarUm("SELECT COUNT(*) AS qt FROM tb_solicitacao WHERE nm_status <> %s", ("Concluído",))["qt"]
+        qt_pendentes = consultarUm("SELECT COUNT(*) AS qt FROM portal_tb_solicitacao WHERE nm_status <> %s", ("Concluído",))["qt"]
     except Exception:  # noqa: BLE001
         return '<span class="badge neutro">SEM DADOS</span>'
     if qt_pendentes:
@@ -47,7 +47,7 @@ def seloBoletas():
     try:
         dic_contagem = consultarUm(
             "SELECT COUNT(*) AS qt_abertos, COALESCE(SUM(nm_prioridade LIKE %s), 0) AS qt_criticos "
-            "FROM tb_boletador_card WHERE nm_coluna <> %s", ("Cr%", "Solucionados"))
+            "FROM portal_tb_boletador_card WHERE nm_coluna <> %s", ("Cr%", "Solucionados"))
     except Exception:  # noqa: BLE001
         return '<span class="badge neutro">SEM DADOS</span>'
     qt_abertos, qt_criticos = int(dic_contagem["qt_abertos"]), int(dic_contagem["qt_criticos"])

@@ -1,12 +1,12 @@
 """Login do Portal TAG: usuários e senhas próprios, gerenciados por um administrador dentro do portal.
 
-- As contas, sessões e vínculos de computador ficam no banco MySQL (tabelas tb_usuario, tb_sessao, tb_dispositivo;
+- As contas, sessões e vínculos de computador ficam no banco MySQL (tabelas portal_tb_usuario, portal_tb_sessao, portal_tb_dispositivo;
   conexão em app/database/db.py, variáveis BANCO_BKO_*).
 - Senhas nunca são guardadas: só o hash PBKDF2-SHA256 com sal individual e "pimenta" (PORTAL_SEGREDO: variável do SO,
   Parameter Store ou env/.env.segredo, que fica fora do git).
 - No primeiro acesso (sem nenhum usuário) o portal pede a criação do administrador.
 - Login persistente: ao entrar, o navegador recebe um cookie com um token aleatório; no servidor fica só o hash do
-  token (tabela tb_sessao). Ao recarregar a página o token é validado e a pessoa continua logada, até a sessão expirar,
+  token (tabela portal_tb_sessao). Ao recarregar a página o token é validado e a pessoa continua logada, até a sessão expirar,
   a pessoa clicar em Sair, trocar a senha ou o administrador desativá-la.
 - Uso no main.py (ponto de entrada de todas as páginas):  usuario = controle_acesso.exigir_login()
 """
@@ -78,7 +78,7 @@ class ErroArquivoUsuarios(Exception):
 
 
 def carregarUsuarios():
-    """Contas cadastradas (tabela tb_usuario). Tabela vazia = primeiro acesso. Falha do banco NUNCA vira lista vazia: senão
+    """Contas cadastradas (tabela portal_tb_usuario). Tabela vazia = primeiro acesso. Falha do banco NUNCA vira lista vazia: senão
     qualquer visitante veria "Criar administrador" e criaria uma conta de administrador."""
     try:
         return banco_seguranca.carregarUsuarios()
@@ -188,7 +188,7 @@ def _hashToken(token):
 
 
 def criarToken(login):
-    """Gera o token do navegador. Só o hash dele é guardado (tabela tb_sessao)."""
+    """Gera o token do navegador. Só o hash dele é guardado (tabela portal_tb_sessao)."""
     token = secrets.token_urlsafe(32)
     banco_seguranca.criarSessao(
         _hashToken(token), login, agora().isoformat(),

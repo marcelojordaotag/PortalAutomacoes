@@ -27,14 +27,25 @@ def localizarMysqldump():
     return "mysqldump"  # tenta o PATH
 
 
+def tabelasDoPortal():
+    """Tabelas do portal (prefixo portal_). O schema é compartilhado com a área inteira: o backup nunca leva tabelas de outros projetos."""
+    from app.database.db import consultarTodos
+
+    return sorted(list(linha.values())[0] for linha in consultarTodos("SHOW TABLES LIKE 'portal\\_%'"))
+
+
 def fazerBackup():
     nm_banco = obterVariavel("BANCO_BKO_NOME")
     dir_backups = obterDiretorioDados("backups_banco")
     arq_backup = dir_backups / f"{nm_banco}_{datetime.now():%Y-%m-%d}.sql"
     ambiente = {**os.environ, "MYSQL_PWD": obterVariavel("BANCO_BKO_SENHA")}
+    lista_tabelas = tabelasDoPortal()
+    if not lista_tabelas:
+        print("Backup cancelado: nenhuma tabela portal_* encontrada no banco.")
+        return 1
     comando = [localizarMysqldump(), f"--host={obterVariavel('BANCO_BKO_HOST')}", f"--port={obterVariavel('BANCO_BKO_PORTA') or 3306}",
                f"--user={obterVariavel('BANCO_BKO_USUARIO')}", "--single-transaction", "--routines", "--default-character-set=utf8mb4",
-               f"--result-file={arq_backup}", nm_banco]
+               f"--result-file={arq_backup}", nm_banco, *lista_tabelas]  # só as tabelas portal_*: o schema é da área inteira
     resultado = subprocess.run(comando, env=ambiente, capture_output=True, text=True)
     if resultado.returncode != 0:
         arq_backup.unlink(missing_ok=True)

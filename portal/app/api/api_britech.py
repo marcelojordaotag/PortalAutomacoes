@@ -1,6 +1,6 @@
 """Busca os dados das carteiras na API Britech e grava o Relatorio_Rentabilidade.xlsx + os extratos de conta corrente.
 
-Uso na linha de comando (le os IDs da tabela tb_britech_carteira):
+Uso na linha de comando (le os IDs da tabela portal_tb_britech_carteira):
     python -m app.api.api_britech
 
 Uso pela página (pagina.py): o app escolhe os IDs e o periodo e chama buscar_dados().
@@ -153,7 +153,7 @@ def _executarHistorico(clientes, data_inicio, data_fim, api, progresso):
     historico = pd.concat(quadros, ignore_index=True)
     historico["Data"] = pd.to_datetime(historico["Data"]).dt.strftime("%Y-%m-%d")
     substituirHistorico(historico)
-    return {"arquivo": "tb_britech_historico_cota", "linhas": len(historico),
+    return {"arquivo": "portal_tb_britech_historico_cota", "linhas": len(historico),
             "carteiras": [id_carteira for id_carteira in clientes if id_carteira not in sem_dados], "sem_dados": sem_dados}
 
 
@@ -291,7 +291,7 @@ def _executarBusca(clientes, data_inicio, data_fim, arquivo_saida, pasta_extrato
 
 def main():
     clientes = listarIdsCarteiras()
-    print(f"{len(clientes)} carteiras lidas de tb_britech_carteira")
+    print(f"{len(clientes)} carteiras lidas de portal_tb_britech_carteira")
     historico_inicio = (date.fromisoformat(DATA_FIM_PADRAO) - timedelta(days=HISTORICO_DIAS_PADRAO)).isoformat()
     try:
         resultado = buscarDados(clientes, DATA_INICIO_PADRAO, DATA_FIM_PADRAO, historico_inicio=historico_inicio)

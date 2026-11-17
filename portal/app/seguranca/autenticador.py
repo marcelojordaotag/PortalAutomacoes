@@ -1,6 +1,6 @@
 """Autenticador (2FA por TOTP): gera o segredo e o QR code, cifra o segredo e confere o código de 6 dígitos.
 
-Compatível com Google Authenticator, Microsoft Authenticator, Authy etc. O segredo de cada usuário fica em tb_usuario_2fa,
+Compatível com Google Authenticator, Microsoft Authenticator, Authy etc. O segredo de cada usuário fica em portal_tb_usuario_2fa,
 cifrado com uma chave derivada do PORTAL_SEGREDO (a mesma proteção das senhas): só o banco não basta para usar o segredo.
 """
 import base64

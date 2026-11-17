@@ -29,8 +29,8 @@ def criarEsquema():
     for comando in lista_comandos:
         cursor.execute(comando)
     conexao.commit()
-    cursor.execute("SHOW TABLES")
-    print(f"{len(cursor.fetchall())} tabelas em {nm_banco} ({len(lista_comandos)} comandos executados)")
+    cursor.execute("SHOW TABLES LIKE 'portal\\_%'")  # o schema é da área inteira: conta só as tabelas do portal
+    print(f"{len(cursor.fetchall())} tabelas do portal em {nm_banco} ({len(lista_comandos)} comandos executados)")
     cursor.close()
     conexao.close()
 

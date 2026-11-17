@@ -1,6 +1,6 @@
 """Aba "Apagar cadastros" da Solicitação de extratos: busca, marca e apaga linhas do cadastro de fundos e cotistas.
 
-Nada é apagado sem confirmação, e cada linha apagada fica copiada em tb_extratos_cadastro_excluido (quem e quando).
+Nada é apagado sem confirmação, e cada linha apagada fica copiada em portal_tb_extratos_cadastro_excluido (quem e quando).
 """
 import pandas as pd
 import streamlit as st
@@ -26,7 +26,7 @@ def _confirmarExclusao(lista_linhas):
                       for l in lista_linhas]),
         hide_index=True, width="stretch")
     st.caption("As rodadas de extratos já abertas não mudam (elas guardam a própria cópia). "
-               "As linhas apagadas ficam guardadas na tabela tb_extratos_cadastro_excluido, caso precise recuperar.")
+               "As linhas apagadas ficam guardadas na tabela portal_tb_extratos_cadastro_excluido, caso precise recuperar.")
     col_apagar, col_cancelar = st.columns(2)
     if col_apagar.button("Apagar definitivamente", type="primary", width="stretch", key="exclusao_confirmar"):
         nm_usuario = (usuarioAtual() or {}).get("usuario", "")

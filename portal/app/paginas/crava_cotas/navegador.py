@@ -3,7 +3,7 @@
 Roda como processo separado (`python navegador.py`), como o importador do boletador. O login fica
 guardado no perfil do navegador entre execuções. Para cada dia (D-2 e depois D-3): abre o card
 "Importar Crava Cotas Fundos Completos", confere o Progresso, filtra "Posição indisponível", copia a tabela e
-fecha o modal. O resultado vai para o banco (tb_crava_leitura*, módulo app.database.crava).
+fecha o modal. O resultado vai para o banco (portal_tb_crava_leitura*, módulo app.database.crava).
 Se tudo foi copiado e conferido, o navegador fecha sozinho; com avisos ou falhas, fica aberto até o usuário fechar.
 """
 import os

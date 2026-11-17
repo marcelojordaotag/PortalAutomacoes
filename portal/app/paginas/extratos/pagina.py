@@ -1080,7 +1080,7 @@ except Exception as erro:
     st.stop()
 
 if df.empty:
-    st.error("O cadastro de fundos (tabela tb_extratos_fundo_cotista) está vazio.")
+    st.error("O cadastro de fundos (tabela portal_tb_extratos_fundo_cotista) está vazio.")
     st.stop()
 
 faltando = [rotulo for campo, rotulo in OBRIGATORIAS.items() if campo not in df.columns]

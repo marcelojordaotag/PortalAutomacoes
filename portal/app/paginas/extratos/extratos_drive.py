@@ -43,7 +43,7 @@ class ArquivoSalvo:
         self.modificado = ds_modificado
 
     def paraTexto(self):
-        """Forma guardada no banco (tb_extratos_anexo_salvo.ds_caminho)."""
+        """Forma guardada no banco (portal_tb_extratos_anexo_salvo.ds_caminho)."""
         return f"drive:{self.id}|{self.pasta}|{self.nome}"
 
 

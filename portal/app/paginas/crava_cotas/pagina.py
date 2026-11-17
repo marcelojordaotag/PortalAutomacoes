@@ -1,4 +1,4 @@
-"""CRAVA COTAS (Streamlit): confere o xlsx de cotas da Britech contra o cadastro fixo (tabela tb_crava_cadastro)."""
+"""CRAVA COTAS (Streamlit): confere o xlsx de cotas da Britech contra o cadastro fixo (tabela portal_tb_crava_cadastro)."""
 import streamlit as st
 
 from app.database.crava import lerCadastro
