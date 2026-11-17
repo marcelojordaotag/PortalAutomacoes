@@ -17,27 +17,21 @@ fazem o papel de Date e Settlement Date, o filtro é Sold/Bought na coluna "Acti
 ficam) e o Client busca os últimos 10 caracteres da Account no "Account Code" do De-Para (conta não achada: vazio).
 
 Colunas de data saem como data abreviada (no Excel, o formato de data curta do sistema). Na aba Todos, o botão
-"Montar e-mail no Outlook" abre o rascunho do Daily Report com uma tabela por banco (só os que têm linhas).
+"Montar e-mail no Gmail" cria o rascunho do Daily Report com uma tabela por banco (só os que têm linhas).
 """
 import html
 import io
-import os
 import re
-import time
 from datetime import date, datetime
-from pathlib import Path
-from urllib.parse import unquote
 
 import pandas as pd
 from dateutil.easter import easter
 import streamlit as st
-from openpyxl import load_workbook
 
-from app.ambiente.config_ambiente import obterVariavel
+from app.paginas.bradesco_miami import arquivos_drive
+from app.utilitarias import email_gmail
 from app.utilitarias.tema import aplicarTema, topo
 
-RAIZ_ARQUIVOS = Path(obterVariavel("OFFSHORE_BKO_PASTA_HISTORICO"))
-ARQUIVO_MODELO = Path(obterVariavel("OFFSHORE_BKO_ARQUIVO_MODELO"))
 ABA_DEPARA = "De-Para Contas"
 COLUNA_DEPARA_CONTA, COLUNA_DEPARA_CLIENTE = "Number", "Account"  # colunas B e E da aba
 # Por banco: pasta dentro de <ano>/<Mês>, início do nome do arquivo e o Client quando a conta não está no De-Para
@@ -115,11 +109,11 @@ def _chaveConta(valor):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def carregarDepara():
+def carregarDepara(login):
     """Lê a aba De-Para Contas do modelo e devolve dois mapas conta -> cliente:
     "numero" (coluna Number: Bradesco e BTG) e "codigo" (coluna Account Code: Morgan Stanley).
     Em chave repetida vale a primeira linha, como no XLOOKUP/VLOOKUP."""
-    pasta_trabalho = load_workbook(ARQUIVO_MODELO, read_only=True, data_only=True)
+    pasta_trabalho = arquivos_drive.abrirModelo(login)
     try:
         linhas = pasta_trabalho[ABA_DEPARA].iter_rows(values_only=True)
         cab = [_norm(coluna) for coluna in next(linhas)]
@@ -143,7 +137,7 @@ def tratar(arquivo, depara, configuracao_item, mais_recente=None):
     col_filtro, regex_filtro = configuracao_item.get("filtro", (COLUNA_FILTRO, FILTRO_TEXTO))
     ultima_cfg = configuracao_item.get("ultima", ULTIMA_COLUNA)
     # openpyxl lê a grade exatamente como está no Excel (o pandas descarta linhas vazias do topo)
-    planilha_aba = load_workbook(arquivo, read_only=True, data_only=True).worksheets[0]
+    planilha_aba = arquivos_drive.abrirPlanilha(arquivo).worksheets[0]
     grade = pd.DataFrame(list(planilha_aba.iter_rows(values_only=True)))
     conta_topo = _contaDoTopo(grade.iloc[:LINHAS_INICIAIS])
     bruto = grade.iloc[LINHAS_INICIAIS:].reset_index(drop=True)
@@ -222,25 +216,19 @@ def paraExcel(abas):
     return mem_arquivo.getvalue()
 
 
-def pastaDoMes(data, banco):
-    """<raiz>/<ano>/<Mês>/<pasta do banco>"""
-    return RAIZ_ARQUIVOS / str(data.year) / MESES[data.month - 1] / BANCOS[banco]["pasta"]
-
-
 def avisoPasta(data, banco=None):
-    """Diz qual parte do caminho <raiz>/<ano>/<Mês>/<banco> não existe (None se está tudo no lugar)."""
-    ano, mes = RAIZ_ARQUIVOS / str(data.year), MESES[data.month - 1]
+    """Diz qual parte do caminho <histórico>/<ano>/<Mês>/<banco> não existe no Drive (None se está tudo no lugar)."""
+    nm_mes = MESES[data.month - 1]
     try:
-        if not RAIZ_ARQUIVOS.exists():
-            return f"Não consegui acessar a pasta dos arquivos ({RAIZ_ARQUIVOS}). Confira se o Drive G: está disponível."
-        if not ano.exists():
-            return f"A pasta do ano {data.year} ainda não existe em {RAIZ_ARQUIVOS}."
-        if not (ano / mes).exists():
-            return f"A pasta {data.year}/{mes} ainda não existe, então não há arquivos para {data:%d/%m/%Y}."
-        if banco and not pastaDoMes(data, banco).exists():
-            return f"A pasta do {banco} não existe em {data.year}/{mes}."
-    except OSError as excecao:
-        return f"Não consegui verificar a pasta {data.year}/{mes}: {excecao}"
+        dict_pastas = arquivos_drive.pastasDoMes(arquivos_drive.loginAtual(), data.year, nm_mes)
+    except arquivos_drive.ERROS_DRIVE as excecao:
+        return f"Não consegui acessar o Drive: {arquivos_drive.textoErro(excecao)}"
+    if not dict_pastas["ano"]:
+        return f"A pasta do ano {data.year} ainda não existe em {arquivos_drive.NOME_HISTORICO}."
+    if not dict_pastas["mes"]:
+        return f"A pasta {data.year}/{nm_mes} ainda não existe, então não há arquivos para {data:%d/%m/%Y}."
+    if banco and BANCOS[banco]["pasta"] not in dict_pastas["bancos"]:
+        return f"A pasta do {banco} não existe em {data.year}/{nm_mes}."
     return None
 
 
@@ -250,8 +238,25 @@ def _prefixos(banco):
 
 
 def arquivosDaData(data, banco):
-    """Caminho do arquivo da data (um por prefixo do banco; pode não existir)."""
-    return [pastaDoMes(data, banco) / f"{pref} - {data:%Y%m%d}.xlsx" for pref in _prefixos(banco)]
+    """Arquivo da data no Drive (um por prefixo do banco; o id é None quando não existe)."""
+    nm_mes = MESES[data.month - 1]
+    dict_dia = arquivos_drive.arquivosDoDia(arquivos_drive.loginAtual(), data.year, nm_mes, f"{data:%Y%m%d}")
+    dict_existentes = dict_dia.get(BANCOS[banco]["pasta"], {})
+    ds_base = "/".join([arquivos_drive.NOME_HISTORICO, str(data.year), nm_mes, BANCOS[banco]["pasta"]])
+    lista_arquivos = []
+    for pref in _prefixos(banco):
+        nm_arquivo = f"{pref} - {data:%Y%m%d}.xlsx"
+        tupla_achada = dict_existentes.get(nm_arquivo.lower())
+        lista_arquivos.append(arquivos_drive.ArquivoDrive(
+            nm_arquivo, tupla_achada[0] if tupla_achada else None, f"{ds_base}/{nm_arquivo}", tupla_achada[2] if tupla_achada else ""))
+    return lista_arquivos
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def tratarBancoEmCache(login, banco, lista_chaves):
+    """tratarBanco com cache: a aba Todos e a aba do banco usam o mesmo resultado, e ele só é refeito se o arquivo mudar."""
+    lista_arquivos = [arquivos_drive.ArquivoDrive(nm_arquivo, id_arquivo, "", ds_modificado) for nm_arquivo, id_arquivo, ds_modificado in lista_chaves]
+    return tratarBanco(banco, lista_arquivos, carregarDepara(login))
 
 
 def _nomes(arquivos):
@@ -263,27 +268,27 @@ def _chaveData(nome):
     return (achou.group(0) if achou else "") + nome
 
 
-@st.cache_data(ttl=60, show_spinner=False)
 def listarArquivos(banco):
-    """Arquivos do banco em todos os meses e anos: texto da lista -> caminhos.
+    """Arquivos do banco em todos os meses e anos: texto da lista -> arquivos.
     Banco com mais de um arquivo por dia (MS) aparece uma vez por data, com todos os arquivos daquele dia."""
     prefixos = _prefixos(banco)
     achados = {}
     try:
-        for caminho in RAIZ_ARQUIVOS.glob(f"*/*/{BANCOS[banco]['pasta']}/*.xlsx"):
-            if caminho.name.startswith("~$"):
-                continue
-            if len(prefixos) == 1:
-                achados[caminho.name] = [str(caminho)]
-                continue
-            achou = re.fullmatch(r"(%s) - (\d{8})\.xlsx" % "|".join(map(re.escape, prefixos)), caminho.name)
-            if achou:
-                achados.setdefault(achou.group(2), []).append(str(caminho))
-    except OSError:
-        pass
+        lista_drive = arquivos_drive.listarTodosDoBanco(arquivos_drive.loginAtual(), BANCOS[banco]["pasta"])
+    except arquivos_drive.ERROS_DRIVE as excecao:
+        st.error(f"Não consegui listar os arquivos do {banco}: {arquivos_drive.textoErro(excecao)}")
+        return {}
+    for dict_arquivo in lista_drive:
+        arquivo = arquivos_drive.ArquivoDrive(dict_arquivo["nome"], dict_arquivo["id"], dict_arquivo["caminho"], dict_arquivo["modificado"])
+        if len(prefixos) == 1:
+            achados[arquivo.name] = [arquivo]
+            continue
+        achou = re.fullmatch(r"(%s) - (\d{8})\.xlsx" % "|".join(map(re.escape, prefixos)), arquivo.name)
+        if achou:
+            achados.setdefault(achou.group(2), []).append(arquivo)
     if len(prefixos) > 1:  # texto da lista: "20260930 [MS, MS2]"
-        achados = {f"{dia} [{', '.join(Path(caminho).name.split(' - ')[0].removeprefix('Transactions_') for caminho in sorted(cs))}]": sorted(cs)
-                   for dia, cs in achados.items()}
+        achados = {f"{dia} [{', '.join(arq.name.split(' - ')[0].removeprefix('Transactions_') for arq in sorted(cs, key=lambda arq: arq.name))}]":
+                   sorted(cs, key=lambda arq: arq.name) for dia, cs in achados.items()}
     return dict(sorted(achados.items(), key=lambda kv: _chaveData(kv[0]), reverse=True))
 
 
@@ -294,17 +299,23 @@ def configDatas(df):
 
 
 def telaBanco(banco, data_sel):
-    arquivos = arquivosDaData(data_sel, banco)
+    try:
+        arquivos = arquivosDaData(data_sel, banco)
+    except arquivos_drive.ERROS_DRIVE as excecao:
+        st.error(f"Não consegui acessar o Drive: {arquivos_drive.textoErro(excecao)}")
+        return
 
     # Opção avançada, oculta por padrão: lista os arquivos de todos os meses e anos (a caixa aceita digitar para filtrar)
     with st.expander("Escolher outro arquivo da pasta"):
-        existentes = listarArquivos(banco)
+        existentes = {}
+        if st.checkbox("Carregar a lista de arquivos de todas as datas", key=f"listar_{banco}"):
+            existentes = listarArquivos(banco)
         escolhido = st.selectbox(
             "Arquivos da pasta (digite a data para filtrar, ex.: 20260930)", list(existentes), index=None,
             placeholder="Usar o arquivo da data selecionada", key=f"arquivo_{banco}",
         )
         if escolhido:
-            arquivos = [Path(caminho) for caminho in existentes[escolhido]]
+            arquivos = existentes[escolhido]
 
     st.caption("Arquivo: " + " | ".join(str(arquivo) for arquivo in arquivos))
     achados = [arquivo for arquivo in arquivos if arquivo.exists()]
@@ -315,17 +326,20 @@ def telaBanco(banco, data_sel):
     if len(achados) < len(arquivos):
         st.info("Não encontrado: " + _nomes([arquivo for arquivo in arquivos if arquivo not in achados]))
     try:
-        df = tratarBanco(banco, achados, carregarDepara())
+        df = tratarBancoEmCache(arquivos_drive.loginAtual(), banco, tuple(arquivo.chave() for arquivo in achados))
     except (KeyError, ValueError, StopIteration) as excecao:
         st.error(str(excecao))
-    except OSError as excecao:
-        st.error(f"Não foi possível abrir o arquivo ou o De-Para ({ARQUIVO_MODELO.name}): {excecao}")
+    except (OSError, *arquivos_drive.ERROS_DRIVE) as excecao:
+        st.error(f"Não foi possível abrir o arquivo ou o De-Para ({arquivos_drive.NOME_MODELO}): {arquivos_drive.textoErro(excecao)}")
     else:
         st.success(f"{len(df)} linhas e {len(df.columns)} colunas.")
         st.dataframe(df, use_container_width=True, hide_index=True, column_config=configDatas(df))
         st.download_button(
             "Baixar Excel tratado", paraExcel({banco: df}),
-            file_name=f"Tratado_{achados[0].name}" if len(achados) == 1 else f"Tratado_{banco}_{_chaveData(achados[0].name)[:8]}.xlsx",
+            file_name=(
+                f"Tratado_{achados[0].name.replace('Transactions_', 'Transactions_Offshore_', 1)}" if len(achados) == 1
+                else f"Tratado_Transactions_Offshore_{banco.replace(' ', '_')}_{_chaveData(achados[0].name)[:8]}.xlsx"
+            ),
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", key=f"baixar_{banco}",
         )
 
@@ -369,9 +383,9 @@ ESTILO_TD = "padding:3px 8px;border:1px solid #ddd;vertical-align:top;"
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def carregarDestinatarios():
+def carregarDestinatarios(login):
     """Para e CC, lidos da aba E-mail do modelo (linha 2, colunas A e B)."""
-    pasta_trabalho = load_workbook(ARQUIVO_MODELO, read_only=True, data_only=True)
+    pasta_trabalho = arquivos_drive.abrirModelo(login)
     try:
         linha = next(pasta_trabalho[ABA_EMAIL].iter_rows(min_row=2, max_row=2, values_only=True))
     finally:
@@ -429,131 +443,64 @@ def _enderecos(lista):
     return achados
 
 
-def _assinaturaPadraoConfigurada():
-    """True se o Outlook já insere assinatura sozinho nas mensagens novas."""
-    import winreg
-    for versao in ("16.0", "15.0", "14.0"):
-        try:
-            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, rf"Software\Microsoft\Office\{versao}\Common\MailSettings") as chave_item:
-                if str(winreg.QueryValueEx(chave_item, "NewSignature")[0]).strip():
-                    return True
-        except OSError:
-            continue
-    return False
-
-
-def carregarAssinatura():
-    """Assinatura salva do Outlook (a mais recente da pasta Signatures) como HTML, mais as imagens a anexar.
-    Devolve (html, [(cid, arquivo)]); None se não houver assinatura."""
-    pasta = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Signatures"
-    arquivos = sorted(pasta.glob("*.htm"), key=lambda arquivo_assinatura: arquivo_assinatura.stat().st_mtime, reverse=True)
-    if not arquivos:
-        return None
-    bruto = arquivos[0].read_bytes()
-    charset = re.search(rb"charset=[\"']?([\w-]+)", bruto[:3000], flags=re.IGNORECASE)
-    try:
-        texto = bruto.decode(charset.group(1).decode() if charset else "cp1252")
-    except (LookupError, UnicodeDecodeError):
-        texto = bruto.decode("cp1252", errors="replace")
-
-    imagens = []
-
-    cids = {}
-
-    def trocar(casamento):  # imagem local da assinatura -> cid (anexada como imagem embutida, uma vez por arquivo)
-        caminho = pasta / unquote(casamento.group(1))
-        if caminho.is_file():
-            if caminho not in cids:
-                cids[caminho] = f"assinatura{len(cids)}@tag"
-                imagens.append((cids[caminho], caminho))
-            return f'src="cid:{cids[caminho]}"'
-        return casamento.group(0)
-
-    texto = re.sub(r'src="([^"]+)"', trocar, texto)
-    estilos = "".join(re.findall(r"<style.*?</style>", texto, flags=re.IGNORECASE | re.DOTALL))
-    corpo = re.search(r"<body[^>]*>(.*)</body>", texto, flags=re.IGNORECASE | re.DOTALL)
-    return estilos + (corpo.group(1) if corpo else texto), imagens
-
-
-def abrirEmailOutlook(assunto, para, cc, corpo):
-    """Abre o rascunho no Outlook com os destinatários resolvidos e a assinatura depois do corpo. Não envia.
-    Devolve a lista de destinatários que o Outlook não conseguiu resolver."""
-    import pythoncom
-    import win32com.client as win32
-
-    pythoncom.CoInitialize()
-    try:
-        mensagem_email = win32.Dispatch("outlook.application").CreateItem(0)
-        for tipo, lista in ((1, para), (2, cc)):  # 1 = Para, 2 = CC
-            for endereco in _enderecos(lista):
-                mensagem_email.Recipients.Add(endereco).Type = tipo
-        mensagem_email.Recipients.ResolveAll()
-        mensagem_email.Subject = assunto
-        nao_resolvidos = [destinatario.Name for destinatario in mensagem_email.Recipients if not destinatario.Resolved]
-
-        mensagem_email.Display()  # carrega a assinatura padrão, se houver uma configurada
-        for _ in range(10):  # espera a assinatura carregar antes de inserir o texto
-            try:
-                if re.search(r"<body", mensagem_email.HTMLBody, flags=re.IGNORECASE):
-                    break
-            except Exception:
-                pass
-            time.sleep(0.2)
-
-        extra = ""
-        if not _assinaturaPadraoConfigurada():  # Outlook sem assinatura padrão: usa a salva em Signatures
-            assinatura = carregarAssinatura()
-            if assinatura:
-                extra, imagens = assinatura
-                for cid, arquivo in imagens:
-                    anexo = mensagem_email.Attachments.Add(str(arquivo))
-                    anexo.PropertyAccessor.SetProperty("http://schemas.microsoft.com/mapi/proptag/0x3712001F", cid)
-                    anexo.PropertyAccessor.SetProperty("http://schemas.microsoft.com/mapi/proptag/0x7FFE000B", True)
-        atual = mensagem_email.HTMLBody
-        casamento_body = re.search(r"<body[^>]*>", atual, flags=re.IGNORECASE)
-        # corpo, depois a assinatura (a do Outlook, se houver, já vem no corpo atual e fica abaixo)
-        mensagem_email.HTMLBody = (atual[: casamento_body.end()] + corpo + extra + atual[casamento_body.end():]) if casamento_body else corpo + extra + atual
-        return nao_resolvidos
-    finally:
-        pythoncom.CoUninitialize()
+def criarRascunhoGmail(assunto, para, cc, corpo):
+    """Cria o rascunho no Gmail (não envia), com a assinatura do Gmail depois do corpo.
+    Devolve (link para abrir o rascunho, endereços que não parecem válidos)."""
+    servico = email_gmail.servicoDaSessao()
+    invalidos = [endereco for endereco in _enderecos(para) + _enderecos(cc) if not re.fullmatch(r"[\w.+'-]+@[\w.-]+\.\w+", endereco)]
+    ds_html = f"<div>{corpo}</div><br>{email_gmail.assinaturaHtml(servico)}"
+    mensagem_email = email_gmail.montarMime(para, assunto, ds_html, cc)
+    return email_gmail.criarRascunho(servico, mensagem_email), invalidos
 
 
 def botaoEmail(resultados, data_sel):
-    if st.button("Montar e-mail no Outlook", key="montar_email"):
+    if st.button("Montar e-mail no Gmail", key="montar_email"):
         corpo, incluidas = corpoEmailHtml(resultados)
         if not incluidas:
             st.warning("Nenhum banco tem linhas para essa data: o e-mail não foi montado.")
             return
         try:
-            para, cc = carregarDestinatarios()
-            nao_resolvidos = abrirEmailOutlook(
+            para, cc = carregarDestinatarios(arquivos_drive.loginAtual())
+            link, invalidos = criarRascunhoGmail(
                 f"{data_sel:%d/%m/%Y} Daily Report | Offshore Transactions", para, cc, corpo)
-        except Exception as excecao:  # Outlook fechado/indisponível ou modelo inacessível
-            st.error(f"Não foi possível montar o e-mail. Abra o Outlook e tente de novo. Detalhe: {excecao}")
+        except email_gmail.GmailNaoConectadoErro:
+            st.error("A conexão com a conta Google expirou. Conecte-se de novo.")
+            st.rerun()
+        except Exception as excecao:  # modelo inacessível ou falha na API
+            st.error(f"Não foi possível montar o e-mail. Detalhe: {excecao}")
         else:
-            st.success("E-mail aberto no Outlook (rascunho, não enviado). Seções: " + ", ".join(incluidas) + ".")
-            if nao_resolvidos:
-                st.warning("O Outlook não reconheceu estes destinatários: " + ", ".join(nao_resolvidos))
+            st.success("Rascunho criado no Gmail (não enviado). Seções: " + ", ".join(incluidas) + ".")
+            st.link_button("Abrir rascunho no Gmail", link)
+            if invalidos:
+                st.warning("Estes destinatários não parecem endereços válidos: " + ", ".join(invalidos))
 
 
 def telaTodos(data_sel):
     """Trata todos os bancos da data de uma vez e junta num Excel, uma aba por banco."""
+    try:
+        arquivos = {banco: arquivosDaData(data_sel, banco) for banco in BANCOS}
+        # baixa de uma vez (em paralelo) todos os arquivos do dia e o modelo; depois o resto da tela usa o cache
+        login = arquivos_drive.loginAtual()
+        arquivos_drive.baixarVarios(login, [(arquivo.id, arquivo.modificado) for lista_banco in arquivos.values()
+                                            for arquivo in lista_banco if arquivo.exists()] + [(arquivos_drive.idModelo(), "")])
+    except arquivos_drive.ERROS_DRIVE as excecao:
+        st.error(f"Não consegui acessar o Drive: {arquivos_drive.textoErro(excecao)}")
+        return
     depara = carregarDeparaSeguro()
     if depara is None:
         return
-
-    arquivos = {banco: arquivosDaData(data_sel, banco) for banco in BANCOS}
     # Opção avançada, oculta por padrão: escolher outro arquivo (de qualquer data) para cada banco
     with st.expander("Escolher outros arquivos da pasta"):
+        ic_listar = st.checkbox("Carregar a lista de arquivos de todas as datas", key="listar_todos")
         for col, banco in zip(st.columns(len(BANCOS)), BANCOS):
             with col:
-                existentes = listarArquivos(banco)
+                existentes = listarArquivos(banco) if ic_listar else {}
                 escolhido = st.selectbox(
                     f"{banco} (digite a data para filtrar)", list(existentes), index=None,
                     placeholder="Usar o arquivo da data selecionada", key=f"arquivo_todos_{banco}",
                 )
                 if escolhido:
-                    arquivos[banco] = [Path(caminho) for caminho in existentes[escolhido]]
+                    arquivos[banco] = existentes[escolhido]
 
     resultados = {}
     aviso_mes = avisoPasta(data_sel)  # raiz, ano ou mês inexistente vale para todos os bancos: avisa uma vez só
@@ -573,9 +520,9 @@ def telaTodos(data_sel):
             st.info(f"{banco}: não encontrado " + _nomes([arquivo for arquivo in arquivos[banco] if arquivo not in achados]))
         arquivos[banco] = achados  # o cartão mostra só o que foi usado
         try:
-            resultados[banco] = tratarBanco(banco, achados, depara)
-        except (KeyError, ValueError, StopIteration, OSError) as excecao:
-            st.error(f"{banco}: {excecao}")
+            resultados[banco] = tratarBancoEmCache(login, banco, tuple(arquivo.chave() for arquivo in achados))
+        except (KeyError, ValueError, StopIteration, OSError, *arquivos_drive.ERROS_DRIVE) as excecao:
+            st.error(f"{banco}: {arquivos_drive.textoErro(excecao)}")
 
     if not resultados:
         return
@@ -592,13 +539,16 @@ def telaTodos(data_sel):
 
 def carregarDeparaSeguro():
     try:
-        return carregarDepara()
-    except (OSError, KeyError, ValueError, StopIteration) as excecao:
-        st.error(f"Não foi possível abrir o De-Para ({ARQUIVO_MODELO.name}): {excecao}")
+        return carregarDepara(arquivos_drive.loginAtual())
+    except (OSError, KeyError, ValueError, StopIteration, *arquivos_drive.ERROS_DRIVE) as excecao:
+        st.error(f"Não foi possível abrir o De-Para ({arquivos_drive.NOME_MODELO}): {arquivos_drive.textoErro(excecao)}")
         return None
 
 
 topo("Transactions Offshore", "Tratamento dos arquivos de transações por banco", app="bradesco")
+if not email_gmail.emailDaSessao():
+    st.warning("Os arquivos do Offshore ficam no Google Drive. Conecte a sua conta Google (\"Conectar ao Google\" na lateral) para continuar.")
+    st.stop()
 
 data_sel = st.date_input("Data do arquivo", value=date.today(), format="DD/MM/YYYY")
 nomes_abas = ["Todos"] + list(BANCOS)

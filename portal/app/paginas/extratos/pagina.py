@@ -1,36 +1,38 @@
 import html
-import json
 import os
 import re
-import shutil
-import time
+import tempfile
 import unicodedata
 from collections import Counter, OrderedDict
 from datetime import date, datetime, timedelta
 from functools import lru_cache
 
 import pandas as pd
-import pythoncom
 import streamlit as st
-import win32com.client as win32
 
 try:
     from pypdf import PdfReader  # opcional: pip install pypdf
 except ImportError:
     PdfReader = None
 
-try:
-    from watchdog.events import FileSystemEventHandler  # opcional: pip install watchdog
-    from watchdog.observers import Observer
-except ImportError:
-    Observer = FileSystemEventHandler = None
-
-from app.ambiente.config_ambiente import obterDiretorioDados  # noqa: E402
+from app.ambiente.config_ambiente import obterDiretorioDados, obterVariavel  # noqa: E402
+from app.paginas.extratos import extratos_drive, modo_teste  # noqa: E402
+from app.utilitarias import email_gmail  # noqa: E402
+from app.paginas.extratos.exclusao import abaApagar  # noqa: E402
+from app.paginas.extratos.importacao import abaImportar  # noqa: E402
+from app.database.extratos import (  # noqa: E402
+    carregarAnexosSalvos,
+    carregarRodadaAberta,
+    listarFundosCotistas,
+    obterVersaoCadastro,
+    salvarAnexosSalvos,
+    salvarRodadaBanco,
+)
 
 # Pasta de dados do app: não depende de onde o comando foi executado
 BASE = str(obterDiretorioDados("extratos"))
-ARQUIVO = os.path.join(BASE, "Template_Fundos_Ativos.xlsx")
 EMAIL_RE = re.compile(r"^[^@\s;,]+@[^@\s;,]+\.[^@\s;,]+$")
+MODO_TESTE = "teste" in st.query_params  # /extratos?teste: tela de teste com dados fictícios (nada real é consultado, enviado ou gravado)
 
 # ==========================================
 # ESTILO
@@ -229,10 +231,8 @@ def listaEmails(valor):
     return saida
 
 
-@st.cache_data
-def carregarPlanilha(caminho, mtime):
-    # dtype=str preserva zeros à esquerda de CPF/CNPJ
-    df = pd.read_excel(caminho, dtype=str).dropna(how="all")
+def _mapearColunas(df):
+    """Renomeia as colunas do cadastro para os nomes usados pelo app. Devolve (tabela, nomes originais das colunas)."""
     originais = [str(coluna_original) for coluna_original in df.columns]
     mapa = {}
     for col in df.columns:
@@ -241,6 +241,13 @@ def carregarPlanilha(caminho, mtime):
             if nm_coluna_norm in nomes and campo not in mapa.values():
                 mapa[col] = campo
     return df.rename(columns=mapa), originais
+
+
+@st.cache_data(ttl=60)
+def carregarPlanilha(versao):
+    # versao (linhas, maior id) invalida o cache quando o cadastro muda; ttl pega edições feitas direto no banco
+    df, originais = _mapearColunas(listarFundosCotistas())
+    return df, originais, datetime.now()
 
 
 def montarItens(df):
@@ -320,119 +327,236 @@ def montarCorpoHtml(item, data_fmt):
 
 
 def inserirNoCorpo(html_existente, corpo):
-    """Coloca o texto logo após <body>, preservando a assinatura do Outlook."""
+    """Coloca o texto logo após <body>, preservando a assinatura."""
     correspondencia = re.search(r"<body[^>]*>", html_existente, flags=re.IGNORECASE)
     if correspondencia:
         return html_existente[: correspondencia.end()] + corpo + html_existente[correspondencia.end():]
     return corpo + html_existente
 
 
-def abrirEmailsOutlook(itens, data_ref, enviar=False):
+def _registrarFalhaEnvio(ds_texto, ic_dialogo):
+    """Dentro do modal a tela é refeita ao fechar; por isso a falha vai para a sessão e aparece depois (mostrarResultadoEnvio)."""
+    if ic_dialogo:
+        st.session_state.setdefault("falhas_envio", []).append(ds_texto)
+    else:
+        st.error(ds_texto)
+
+
+def emailDeTeste():
+    """Endereço que recebe todos os e-mails no modo de teste. Na tela de teste (/extratos?teste) é sempre o fixo do modo_teste;
+    fora dela, só se a variável de ambiente EXTRATOS_EMAIL_TESTE estiver definida (aí todo e-mail sai só para esse endereço)."""
+    return modo_teste.EMAIL_DE_TESTE if MODO_TESTE else obterVariavel("EXTRATOS_EMAIL_TESTE").strip()
+
+
+def _destinoDoEnvio(elemento, data_fmt):
+    """(destinatários, assunto em minúsculas) com que o e-mail do item sai: o real ou, no modo de teste, o endereço de teste
+    com [TESTE] no assunto. Serve para achar o e-mail enviado em Enviados e a conversa dele."""
+    ds_teste = emailDeTeste()
+    ds_assunto = montarAssunto(elemento, data_fmt).lower()
+    if ds_teste:
+        return {ds_teste.lower()}, f"[teste] {ds_assunto}"
+    return {email.lower() for email in listaEmails(elemento["emails"])}, ds_assunto
+
+
+def enviarEmailsGmail(itens, data_ref, ic_dialogo=False):
+    """Envia um e-mail por item, pela conta Gmail conectada, com assinatura e cópia (CC). Devolve quantos foram enviados.
+    No modo de teste (emailDeTeste) o destinatário é o e-mail de teste, sem CC, e o assunto leva [TESTE]."""
     data_fmt = data_ref.strftime("%d/%m")
-    abertos = 0
-    pythoncom.CoInitialize()
+    ds_teste = emailDeTeste()
+    qt_enviados = 0
     try:
-        aplicativo_outlook = win32.Dispatch("outlook.application")
-        for item in itens:
-            try:
-                mensagem_email = aplicativo_outlook.CreateItem(0)
-                mensagem_email.To = item["emails"]
-
-                # Insere os e-mails em cópia (CC)
-                if EMAILS_EM_COPIA:
-                    mensagem_email.CC = EMAILS_EM_COPIA
-
-                mensagem_email.Subject = montarAssunto(item, data_fmt)
-                mensagem_email.Display()  # carrega a assinatura padrão
-                for _ in range(10):  # espera a assinatura carregar antes de inserir o texto
-                    try:
-                        if re.search(r"<body", mensagem_email.HTMLBody, flags=re.IGNORECASE):
-                            break
-                    except Exception:
-                        pass
-                    time.sleep(0.2)
-                mensagem_email.HTMLBody = inserirNoCorpo(mensagem_email.HTMLBody, montarCorpoHtml(item, data_fmt))
-                if enviar:
-                    mensagem_email.Send()
-                abertos += 1
-            except Exception as erro:
-                st.error(f"Não foi possível abrir o e-mail para {item['emails']}: {erro}")
-    except Exception as erro:
-        st.error(f"Não foi possível conectar ao Outlook. Abra o Outlook e tente de novo. Detalhe: {erro}")
-    finally:
-        pythoncom.CoUninitialize()
-    return abertos
+        servico = email_gmail.servicoDaSessao()
+    except email_gmail.GmailNaoConectadoErro:
+        _registrarFalhaEnvio("A conexão com a conta Google expirou ou não existe. Conecte-se de novo "
+                             "(use \"Conectar ao Google\" na lateral).", ic_dialogo)
+        return 0
+    ds_assinatura = email_gmail.assinaturaHtml(servico)
+    for item in itens:
+        try:
+            ds_html = f"<div>{montarCorpoHtml(item, data_fmt)}</div><br>{ds_assinatura}"
+            mensagem_email = email_gmail.montarMime(
+                ds_teste or item["emails"], ("[TESTE] " if ds_teste else "") + montarAssunto(item, data_fmt), ds_html,
+                "" if ds_teste else (EMAILS_EM_COPIA or ""))
+            email_gmail.enviarEmail(servico, mensagem_email)
+            qt_enviados += 1
+        except Exception as erro:
+            _registrarFalhaEnvio(f"Não foi possível enviar o e-mail para {item['emails']}: {erro}", ic_dialogo)
+    return qt_enviados
 
 
-PR_SMTP = "http://schemas.microsoft.com/mapi/proptag/0x39FE001E"
+def mostrarResultadoEnvio():
+    """Resultado do último envio feito pelo modal: aviso de sucesso e falhas, se houve."""
+    ds_aviso = st.session_state.pop("aviso_envio", None)
+    if ds_aviso:
+        st.success(ds_aviso)
+    for ds_falha in st.session_state.pop("falhas_envio", []):
+        st.error(ds_falha)
+
+
+HORAS_TRAVA_ENVIO = 24  # e-mail enviado há menos que isso pede uma confirmação a mais para ser enviado de novo
+
+
+def enviosRecentes(itens, data_ref, ic_nova_rodada):
+    """Trava contra envio em duplicidade. Devolve ({índice do item: quando foi enviado}, ic_erro) com os e-mails que já saíram
+    nas últimas HORAS_TRAVA_ENVIO horas: pelo Gmail desta conta (mesmo destinatário e mesmo assunto) ou, ao abrir uma rodada nova,
+    por uma rodada aberta há menos tempo que isso para a mesma data de referência (inclusive a de outra pessoa)."""
+    data_fmt = data_ref.strftime("%d/%m")
+    dt_limite = datetime.now() - timedelta(hours=HORAS_TRAVA_ENVIO)
+    dict_recentes, ic_erro = {}, False
+    try:
+        servico = email_gmail.servicoDaSessao()
+        lista_enviados = email_gmail.buscarMensagens(servico, f"in:sent subject:extrato after:{email_gmail.segundosEpoch(dt_limite)}")
+        for ordem_item, item in enumerate(itens):
+            esperados = {email.lower() for email in listaEmails(item["emails"])}
+            ds_assunto = montarAssunto(item, data_fmt).lower()
+            lista_quando = [mensagem.quando for mensagem in lista_enviados if esperados <= mensagem.para and mensagem.assunto.lower() == ds_assunto]
+            if lista_quando:
+                dict_recentes[ordem_item] = max(lista_quando)
+    except Exception:  # noqa: BLE001  (sem a conferência, a trava avisa que não conseguiu verificar)
+        ic_erro = True
+    if ic_nova_rodada:
+        lista_rodadas = [st.session_state.get("rodada")]
+        try:
+            lista_rodadas.append(carregarRodadaAberta()[0])
+        except Exception:  # noqa: BLE001
+            ic_erro = True
+        for rodada_aberta in lista_rodadas:
+            if rodada_aberta and rodada_aberta["data"] == data_ref and rodada_aberta["inicio"] >= dt_limite:
+                lista_emails_rodada = {item_rodada["emails"] for item_rodada in rodada_aberta["itens"]}
+                for ordem_item, item in enumerate(itens):
+                    if item["emails"] in lista_emails_rodada:
+                        dict_recentes.setdefault(ordem_item, rodada_aberta["inicio"])
+    return dict_recentes, ic_erro
+
+
+@st.dialog("Revisar e enviar os e-mails", width="large")
+def dialogoRevisarEnvio(itens, data_ref, rodada_atual=None, qt_sem_email=0):
+    """Mostra todos os e-mails que vão sair, com a prévia de cada um. Só depois da conferência a pessoa confirma e todos
+    são enviados de uma vez. Sem `rodada_atual`, o envio abre uma rodada nova de conferência."""
+    data_fmt = data_ref.strftime("%d/%m")
+    ds_conta = email_gmail.emailDaSessao()
+    if not ds_conta:
+        st.error("A conexão com a conta Google expirou ou não existe. Feche esta janela e use \"Conectar ao Google\" na lateral.")
+        return
+    ds_teste = emailDeTeste()
+    if ds_teste:
+        if MODO_TESTE:
+            st.warning(f"TELA DE TESTE: os e-mails saem de verdade, mas só para **{ds_teste}**, sem cópia (CC) e com [TESTE] no assunto. "
+                       "Nenhum cotista recebe nada.")
+        else:
+            itens = itens[:3]  # no teste por variável de ambiente saem só os 3 primeiros
+            st.warning(f"MODO TESTE: os e-mails saem só para **{ds_teste}**, sem CC, com [TESTE] no assunto. "
+                       "Nenhum cotista recebe nada e a rodada de conferência não é aberta.")
+        st.markdown(f"**{len(itens)} e-mail(s)** serão enviados agora pela conta **{ds_conta}**.")
+    else:
+        st.markdown(
+            f"**{len(itens)} e-mail(s)** serão enviados agora pela conta **{ds_conta}**, com cópia (CC) para {EMAILS_EM_COPIA}. "
+            "Confira a lista e a prévia antes de confirmar."
+        )
+    if qt_sem_email:
+        st.caption(f"{qt_sem_email} cotista(s) sem e-mail cadastrado ficam de fora.")
+    lista_opcoes = [f"{ordem + 1}. {item['emails']}" for ordem, item in enumerate(itens)]
+    ds_chave_lista = f"{len(itens)}|{hash(tuple(item['emails'] for item in itens))}"
+    if st.session_state.get("dlg_lista") != ds_chave_lista:  # outra lista de e-mails (ex.: só os pendentes): volta ao primeiro
+        st.session_state["dlg_lista"] = ds_chave_lista
+        st.session_state["dlg_previa"] = lista_opcoes[0]
+    if st.session_state.get("dlg_previa") not in lista_opcoes:
+        st.session_state["dlg_previa"] = lista_opcoes[0]
+    nr_atual = lista_opcoes.index(st.session_state["dlg_previa"])
+
+    # trava contra envio em duplicidade: confere uma vez por lista (e a cada 2 min), não a cada clique nos botões
+    dict_guardado = st.session_state.get("dlg_recentes")
+    if ds_teste or MODO_TESTE:
+        dict_recentes, ic_erro_verificacao = {}, False  # modo de teste não tem trava: nada vai para os cotistas
+    elif dict_guardado and dict_guardado["chave"] == ds_chave_lista and (datetime.now() - dict_guardado["quando"]).total_seconds() < 120:
+        dict_recentes, ic_erro_verificacao = dict_guardado["recentes"], dict_guardado["erro"]
+    else:
+        dict_recentes, ic_erro_verificacao = enviosRecentes(itens, data_ref, rodada_atual is None)
+        st.session_state["dlg_recentes"] = {"chave": ds_chave_lista, "quando": datetime.now(), "recentes": dict_recentes, "erro": ic_erro_verificacao}
+
+    def irPara(nr_destino):
+        st.session_state["dlg_previa"] = lista_opcoes[nr_destino]
+
+    coluna_anterior, coluna_escolha, coluna_proximo = st.columns([1, 4, 1])
+    coluna_anterior.button("← Anterior", key="dlg_anterior", disabled=nr_atual == 0, on_click=irPara, args=(nr_atual - 1,), use_container_width=True)
+    coluna_proximo.button("Próximo →", key="dlg_proximo", disabled=nr_atual == len(itens) - 1, on_click=irPara, args=(nr_atual + 1,), use_container_width=True)
+    coluna_escolha.selectbox("E-mail", lista_opcoes, key="dlg_previa", label_visibility="collapsed")
+    st.caption(f"E-mail {nr_atual + 1} de {len(itens)}")
+    item_previa = itens[nr_atual]
+    with st.container(border=True):
+        if nr_atual in dict_recentes:
+            st.markdown(f":red[**Já enviado em {dict_recentes[nr_atual]:%d/%m às %H:%M}.**]")
+        st.markdown(
+            f"**Para:** {html.escape(ds_teste or item_previa['emails'])}  \n**CC:** {'-' if ds_teste else html.escape(EMAILS_EM_COPIA or '-')}  \n"
+            f"**Assunto:** {html.escape(montarAssunto(item_previa, data_fmt))}"
+        )
+        st.divider()
+        st.markdown(montarCorpoHtml(item_previa, data_fmt), unsafe_allow_html=True)
+    st.caption("A assinatura do seu Gmail é incluída no envio.")
+
+    ic_confirmou_repetir = True
+    if ic_erro_verificacao and not dict_recentes:
+        st.caption("Não consegui conferir se estes e-mails já foram enviados antes.")
+    if dict_recentes:
+        dt_ultimo = max(dict_recentes.values())
+        st.error(f"**Atenção:** {len(dict_recentes)} de {len(itens)} e-mail(s) já foram enviados nas últimas {HORAS_TRAVA_ENVIO} horas "
+                 f"(o último em {dt_ultimo:%d/%m às %H:%M}). Quer enviar mesmo assim?")
+        with st.expander("Ver quais já foram enviados"):
+            for ordem_item, dt_envio in sorted(dict_recentes.items()):
+                st.write(f"{ordem_item + 1}. {itens[ordem_item]['emails']}: enviado em {dt_envio:%d/%m às %H:%M}")
+        ic_confirmou_repetir = st.checkbox("Sim, já foram enviados e quero enviar mesmo assim", key=f"dlg_repetir_{ds_chave_lista}")
+
+    ic_conferido = st.checkbox("Conferi os e-mails e quero enviá-los", key=f"dlg_ok_{len(itens)}_{abs(hash(tuple(i['emails'] for i in itens)))}")
+    coluna_enviar, coluna_cancelar = st.columns(2)
+    ds_botao = f"Enviar mesmo assim ({len(itens)})" if dict_recentes else f"Enviar {len(itens)} e-mail(s)"
+    if coluna_enviar.button(ds_botao, type="primary", disabled=not (ic_conferido and ic_confirmou_repetir), use_container_width=True, key="dlg_enviar"):
+        dt_inicio = datetime.now()
+        with st.spinner("Enviando..."):
+            qt_enviados = enviarEmailsGmail(itens, data_ref, ic_dialogo=True)
+        if qt_enviados:
+            if rodada_atual is None and (not ds_teste or MODO_TESTE):  # a rodada da tela de teste fica só na sessão
+                st.session_state["rodada"] = {"inicio": dt_inicio, "data": data_ref, "itens": itens}
+                salvarRodada(st.session_state["rodada"])
+                st.session_state.pop("conferencia", None)
+            st.session_state["aviso_envio"] = f"{qt_enviados} de {len(itens)} e-mail(s) enviado(s)."
+        st.session_state.pop("dlg_recentes", None)  # a próxima abertura do modal confere de novo (já vai achar estes envios)
+        st.rerun()
+    if coluna_cancelar.button("Cancelar", use_container_width=True, key="dlg_cancelar"):
+        st.rerun()
+
+
 NDR_MARCAS = (
     "undeliverable", "delivery status notification", "mail delivery", "returned mail",
     "não foi possível entregar", "nao foi possivel entregar", "falha na entrega", "não entregue",
 )
 
 
-def _smtp(rec):
-    try:
-        endereco = rec.PropertyAccessor.GetProperty(PR_SMTP)
-        if endereco:
-            return str(endereco).lower()
-    except Exception:
-        pass
-    try:
-        return str(rec.Address).lower()
-    except Exception:
-        return ""
-
-
-def _destinatarios(texto_mensagem):
-    """Endereços SMTP dos destinatários 'Para' da mensagem."""
-    try:
-        return {_smtp(destinatario) for destinatario in texto_mensagem.Recipients if destinatario.Type == 1} - {""}
-    except Exception:
-        return set()
-
-
-def _recentes(pasta, campo, desde):
-    """Itens da pasta com data >= desde, do mais novo para o mais antigo."""
-    itens = pasta.Items
-    itens.Sort(f"[{campo}]", True)
-    achados = []
-    for mensagem in itens:
-        try:
-            quando = getattr(mensagem, campo).replace(tzinfo=None)
-        except Exception:
-            continue
-        if quando < desde:
-            break
-        achados.append(mensagem)
-    return achados
-
-
-def conferirEnvios(itens, desde):
-    """Confere no Outlook o que aconteceu com cada e-mail aberto. Retorna {indice: status}."""
+def conferirEnvios(itens, desde, data_ref):
+    """Confere no Gmail o que aconteceu com cada e-mail criado. Retorna {indice: status}."""
+    data_fmt = data_ref.strftime("%d/%m")
     desde = desde - timedelta(minutes=1)
     status = {ordem_item: "Aguardando envio" for ordem_item in range(len(itens))}
-    pythoncom.CoInitialize()
     try:
-        ns = win32.Dispatch("outlook.application").GetNamespace("MAPI")
-        enviados = []
-        for mensagem in _recentes(ns.GetDefaultFolder(5), "SentOn", desde):
-            try:
-                enviados.append((_destinatarios(mensagem), str(mensagem.Subject).lower(), mensagem.SentOn.replace(tzinfo=None)))
-            except Exception:
-                continue
-        saida = [(_destinatarios(mensagem), str(mensagem.Subject).lower()) for mensagem in ns.GetDefaultFolder(4).Items]
-        devolvidos = []
-        for mensagem in _recentes(ns.GetDefaultFolder(6), "ReceivedTime", desde):
-            try:
-                if any(chave_item in str(mensagem.Subject).lower() for chave_item in NDR_MARCAS):
-                    devolvidos.append((mensagem.ReceivedTime.replace(tzinfo=None), str(mensagem.Body).lower()))
-            except Exception:
-                continue
+        servico = email_gmail.servicoDaSessao()
+    except email_gmail.GmailNaoConectadoErro:
+        st.error("A conexão com a conta Google expirou ou não existe. Conecte-se de novo (use \"Conectar ao Google\" na lateral).")
+        return None
+    try:
+        vl_apos = email_gmail.segundosEpoch(desde)
+        enviados = [(mensagem.para, mensagem.assunto.lower(), mensagem.quando)
+                    for mensagem in email_gmail.buscarMensagens(servico, f"in:sent subject:extrato after:{vl_apos}")]
+        saida = [(mensagem.para, mensagem.assunto.lower()) for mensagem in email_gmail.listarRascunhos(servico)]
+        devolvidos = [
+            (mensagem.quando, mensagem.corpo.lower())
+            for mensagem in email_gmail.buscarMensagens(servico, f"(from:mailer-daemon OR from:postmaster) after:{vl_apos}")
+            if any(chave_item in mensagem.assunto.lower() for chave_item in NDR_MARCAS)
+        ]
 
         for ordem_item, elemento in enumerate(itens):
-            esperados = {email.lower() for email in listaEmails(elemento["emails"])}
-            casados = [dict_ambiente for dest, assunto, dict_ambiente in enviados if esperados <= dest and "extrato" in assunto]
+            esperados, ds_assunto_item = _destinoDoEnvio(elemento, data_fmt)
+            # fora do teste basta "extrato" no assunto; no teste (todos vão ao mesmo endereço) vale o assunto completo
+            casados = [dt_envio for dest, assunto, dt_envio in enviados
+                       if esperados <= dest and (assunto == ds_assunto_item if emailDeTeste() else "extrato" in assunto)]
             if casados:
                 status[ordem_item] = "Enviado"
                 # só vale devolução recebida depois do envio mais antigo deste e-mail
@@ -440,17 +564,14 @@ def conferirEnvios(itens, desde):
                 if any(rec >= primeiro and email_esperado in corpo for rec, corpo in devolvidos for email_esperado in esperados):
                     status[ordem_item] = "Erro de entrega"
             elif any(esperados <= dest and "extrato" in assunto for dest, assunto in saida):
-                status[ordem_item] = "Na caixa de saída"
+                status[ordem_item] = "Em rascunho"
         return status
     except Exception as erro:
-        st.error(f"Não foi possível conferir no Outlook: {erro}")
+        st.error(f"Não foi possível conferir no Gmail: {erro}")
         return None
-    finally:
-        pythoncom.CoUninitialize()
 
 
 PASTA_EXTRATOS = os.path.join(BASE, "Extratos")
-PR_ANEXO_OCULTO = "http://schemas.microsoft.com/mapi/proptag/0x7FFE000B"
 PREFIXO_REVISAR = "_Revisar"  # anexos sem fundo identificado; também reclassificados a cada conferência
 
 
@@ -464,31 +585,13 @@ def _assuntoBase(assunto):
     return re.sub(r"^\s*((re|res|enc|fw|fwd|rv)\s*:\s*)+", "", str(assunto), flags=re.I).strip().lower()
 
 
-def _remetente(texto_mensagem):
-    try:
-        if str(texto_mensagem.SenderEmailType).upper() == "SMTP":
-            return str(texto_mensagem.SenderEmailAddress).lower()
-        return str(texto_mensagem.Sender.GetExchangeUser().PrimarySmtpAddress).lower()
-    except Exception:
-        return ""
-
-
 def _anexoValido(anexo):
-    """Só arquivos de verdade: ignora itens embutidos, anexos ocultos e logos de assinatura."""
-    try:
-        if anexo.Type != 1:
-            return False
-        try:
-            if anexo.PropertyAccessor.GetProperty(PR_ANEXO_OCULTO):
-                return False
-        except Exception:
-            pass
-        nome = str(anexo.FileName).lower()
-        if nome.endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp")) and int(anexo.Size) < 50000:
-            return False
-        return True
-    except Exception:
+    """Só arquivos de verdade: ignora imagens embutidas e logos de assinatura."""
+    if anexo.embutido:
         return False
+    if anexo.nome.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp")) and anexo.tamanho < 50000:
+        return False
+    return True
 
 
 # ==========================================
@@ -589,7 +692,10 @@ def _textoPdfCache(caminho, mtime, tamanho, max_paginas=3):
 
 
 def _textoPdf(caminho, max_paginas=3):
-    """Texto das primeiras páginas do PDF (com cache por arquivo, para não reler a cada conferência)."""
+    """Texto das primeiras páginas do PDF (com cache por arquivo, para não reler a cada conferência).
+    `caminho` é um arquivo local (o temporário, antes de ir para o Drive) ou um ArquivoSalvo (já no Drive)."""
+    if isinstance(caminho, extratos_drive.ArquivoSalvo):
+        return extratos_drive.textoDoPdf(caminho)
     if PdfReader is None or not caminho.lower().endswith(".pdf"):
         return ""
     try:
@@ -643,20 +749,8 @@ def _fundoIdentificado(item, nome_arquivo, texto_mensagem, caminho):
     if len(fundos) == 1:
         return fundos[0]
 
-    def corpo():
-        try:
-            return str(texto_mensagem.Body)
-        except Exception:
-            return ""
-
-    def assunto():
-        try:
-            return str(texto_mensagem.Subject)
-        except Exception:
-            return ""
-
     total = {}
-    for peso, fonte in ((3, nome_arquivo), (3, _textoPdf(caminho)), (1, assunto()), (0.5, corpo())):
+    for peso, fonte in ((3, nome_arquivo), (3, _textoPdf(caminho)), (1, texto_mensagem.assunto), (0.5, texto_mensagem.corpo)):
         for fundo, vl_pontos in _pontuar(item, fonte).items():
             total[fundo] = total.get(fundo, 0) + vl_pontos * peso
     return _vencedor(total)
@@ -664,10 +758,7 @@ def _fundoIdentificado(item, nome_arquivo, texto_mensagem, caminho):
 
 def _pastaSemFundo(texto_mensagem):
     """Pasta de revisão para anexos que não foram associados a nenhum fundo."""
-    try:
-        remetente = re.sub(r"\s+", " ", str(texto_mensagem.SenderName)).strip()
-    except Exception:
-        remetente = ""
+    remetente = re.sub(r"\s+", " ", texto_mensagem.nome_remetente or texto_mensagem.remetente).strip()
     return f"{PREFIXO_REVISAR} - {remetente}" if remetente else f"{PREFIXO_REVISAR} - remetente desconhecido"
 
 
@@ -676,101 +767,126 @@ def _fundoDoAnexo(item, nome_arquivo, texto_mensagem, caminho):
     return _fundoIdentificado(item, nome_arquivo, texto_mensagem, caminho) or _pastaSemFundo(texto_mensagem)
 
 
+def _pastaDoArquivo(caminho):
+    """Nome da pasta em que o arquivo está (a do fundo ou a de revisão)."""
+    if isinstance(caminho, extratos_drive.ArquivoSalvo):
+        return caminho.pasta
+    return os.path.basename(os.path.dirname(caminho))
+
+
 def _emPastaSemFundo(caminho):
-    pasta = os.path.basename(os.path.dirname(caminho))
-    return pasta.startswith((PREFIXO_REVISAR, "Remetente"))  # "Remetente" = nome antigo da pasta
+    return _pastaDoArquivo(caminho).startswith((PREFIXO_REVISAR, "Remetente"))  # "Remetente" = nome antigo da pasta
 
 
-def _moverParaPasta(origem, pasta_mes, nome_pasta, nome, evitar_duplicata=False):
-    """Move o arquivo para <pasta_mes>/<nome_pasta>/ sem sobrescrever nada. Com evitar_duplicata,
-    se a pasta já tem um arquivo de mesmo nome e tamanho, descarta a cópia e aponta para o existente."""
-    pasta = os.path.join(pasta_mes, _nomeSeguro(nome_pasta))
-    os.makedirs(pasta, exist_ok=True)
-    base, extensao = os.path.splitext(nome)
-    destino, nr_copia = os.path.join(pasta, nome), 1
-    while os.path.exists(destino):
-        if evitar_duplicata and os.path.getsize(destino) == os.path.getsize(origem):
-            os.remove(origem)
-            return destino
-        destino = os.path.join(pasta, f"{base} ({nr_copia}){extensao}")
-        nr_copia += 1
-    shutil.move(origem, destino)
-    return destino
+def _idPastaNoDrive(login, nm_mes, nome_pasta):
+    """(id da pasta, nome real da pasta) em <raiz>/<ano>/<MM>- <Mês>/ do Drive: a do fundo (a que já existe com nome parecido ou
+    uma nova) ou a de revisão. Cria o ano, o mês e a pasta se ainda não existirem."""
+    id_mes = extratos_drive.idPastaDoMes(login, int(nm_mes[:4]), int(nm_mes[5:7]), ic_criar=True)
+    if nome_pasta.startswith(PREFIXO_REVISAR):
+        id_pasta = extratos_drive.idPastaPorNome(login, id_mes, nome_pasta)
+    else:
+        id_pasta = extratos_drive.idPastaDoFundo(login, id_mes, nome_pasta, ic_criar=True)
+    return id_pasta, extratos_drive.nomeDaPasta(login, id_mes, id_pasta, _nomeSeguro(nome_pasta))
+
+
+def _guardarNoDrive(origem, nm_mes, nome_pasta, nome, evitar_duplicata=False):
+    """Envia o arquivo temporário para a pasta do fundo no Drive sem sobrescrever nada e apaga o temporário. Com
+    evitar_duplicata, se a pasta já tem um arquivo de mesmo nome e tamanho, não envia e aponta para o existente."""
+    login = extratos_drive.loginAtual()
+    id_pasta, nm_pasta_real = _idPastaNoDrive(login, nm_mes, nome_pasta)
+    ds_texto = _textoPdf(origem)  # lido do temporário: vale para o arquivo no Drive e evita baixá-lo de novo
+    with open(origem, "rb") as arquivo_origem:
+        conteudo = arquivo_origem.read()
+    arquivo = extratos_drive.salvarArquivo(login, id_pasta, nm_pasta_real, nome, conteudo, evitar_duplicata)
+    extratos_drive.guardarTexto(arquivo, ds_texto)
+    os.remove(origem)
+    return arquivo
+
+
+def _moverNoDrive(arquivo, nm_mes, nome_pasta):
+    """Move um arquivo que já está no Drive (ex.: da pasta de revisão) para a pasta do fundo. Se a pasta do fundo já tem um
+    arquivo de mesmo nome e tamanho, aponta para ele e deixa a cópia onde está (a conta não apaga arquivos do Drive)."""
+    login = extratos_drive.loginAtual()
+    id_pasta, nm_pasta_real = _idPastaNoDrive(login, nm_mes, nome_pasta)
+    nr_tamanho = extratos_drive.tamanhoDoArquivo(login, arquivo)
+    for dict_existente in extratos_drive.listarArquivos(login, id_pasta):
+        if dict_existente["nome"].lower() == arquivo.nome.lower() and dict_existente["tamanho"] == nr_tamanho:
+            return extratos_drive.ArquivoSalvo(dict_existente["id"], dict_existente["nome"], nm_pasta_real, dict_existente["modificado"])
+    return extratos_drive.moverArquivo(login, arquivo, id_pasta, nm_pasta_real)
+
+
+def _respostasAosEnviados(servico, itens, desde, data_fmt):
+    """Só as respostas aos e-mails que nós enviamos: acha em Enviados o e-mail de cada item (mesmos destinatários e mesmo assunto)
+    e lê a conversa (thread) dele. Toda mensagem da conversa que não é um dos nossos envios e tem anexo é resposta (inclusive uma
+    resposta sua para você mesmo, usada nos testes). Devolve [(mensagem, índice do item)]. Mensagem avulsa na caixa de entrada,
+    fora dessas conversas, não conta."""
+    lista_enviados = email_gmail.buscarMensagens(servico, f"in:sent subject:extrato after:{email_gmail.segundosEpoch(desde)}")
+    lista_respostas, vistos = [], set()
+    for ordem_item, elemento in enumerate(itens):
+        esperados, ds_assunto = _destinoDoEnvio(elemento, data_fmt)
+        lista_nossos = [enviada for enviada in lista_enviados
+                        if enviada.id_conversa and esperados <= enviada.para and enviada.assunto.lower() == ds_assunto]
+        ids_enviados = {enviada.id for enviada in lista_nossos}
+        for id_conversa in {enviada.id_conversa for enviada in lista_nossos}:
+            for mensagem in email_gmail.mensagensDaConversa(servico, id_conversa):
+                if mensagem.id in ids_enviados or not mensagem.anexos or (mensagem.id, ordem_item) in vistos:
+                    continue
+                vistos.add((mensagem.id, ordem_item))
+                lista_respostas.append((mensagem, ordem_item))
+    return lista_respostas
 
 
 def conferirRespostas(itens, desde, data_ref, pasta_mes):
-    """Procura respostas com anexo na Caixa de Entrada e salva os arquivos em
-    Extratos/AAAA-MM/<Fundo>/. Retorna ({indice: n_cotistas_recebidos}, n_salvos_agora, falhas) ou None."""
+    """Procura as respostas com anexo aos e-mails que nós enviamos (na conversa de cada um) e salva os arquivos na pasta do
+    fundo, no Drive. Retorna ({indice: n_cotistas_recebidos}, n_salvos_agora, falhas) ou None."""
     desde = desde - timedelta(minutes=1)
     data_fmt = data_ref.strftime("%d/%m")
-    esperados = [{email.lower() for email in listaEmails(elemento["emails"])} for elemento in itens]
-    assuntos = [_assuntoBase(montarAssunto(elemento, data_fmt)) for elemento in itens]
-    repetidos = Counter(assuntos)
-
-    os.makedirs(pasta_mes, exist_ok=True)
-    manifesto_path = os.path.join(pasta_mes, "_salvos.json")
-    try:
-        with open(manifesto_path, encoding="utf-8") as arquivo:
-            manifesto = json.load(arquivo)
-    except Exception:
-        manifesto = {}
+    nm_mes = os.path.basename(pasta_mes)  # AAAA-MM
+    manifesto = st.session_state.setdefault("teste_manifesto", {}) if MODO_TESTE else carregarAnexosSalvos(nm_mes, PASTA_EXTRATOS)
 
     cobertos, sem_ident, falhas, novos = {}, {}, [], 0
-    pythoncom.CoInitialize()
     try:
-        ns = win32.Dispatch("outlook.application").GetNamespace("MAPI")
-        for mensagem in _recentes(ns.GetDefaultFolder(6), "ReceivedTime", desde):
-            try:
-                if mensagem.Class != 43 or mensagem.Attachments.Count == 0:
-                    continue
-                remetente, assunto = _remetente(mensagem), _assuntoBase(mensagem.Subject)
-            except Exception:
-                continue
+        servico = email_gmail.servicoDaSessao()
+    except email_gmail.GmailNaoConectadoErro:
+        st.error("A conexão com a conta Google expirou ou não existe. Conecte-se de novo (use \"Conectar ao Google\" na lateral).")
+        return None
+    try:
+        for mensagem, ordem_candidata in _respostasAosEnviados(servico, itens, desde, data_fmt):
+            candidatos = [ordem_candidata]  # a resposta é de um e-mail nosso: o item já é conhecido
 
-            # ignora resposta que cita outra data de referência (ex.: extrato de outro mês)
-            datas = re.findall(r"\b\d{2}/\d{2}\b", assunto)
-            if datas and data_fmt not in datas:
-                continue
-
-            # todos os itens do remetente; se houver mais de um, o conteúdo do anexo desempata
-            candidatos = [chave_item for chave_item, esperados_item in enumerate(esperados) if remetente in esperados_item and "extrato" in assunto]
-            if not candidatos:
-                candidatos = [chave_item for chave_item, assunto_item in enumerate(assuntos) if assunto_item == assunto and repetidos[assunto_item] == 1]
-            if not candidatos:
-                continue
-
-            for anexo in mensagem.Attachments:
+            for anexo in mensagem.anexos:
                 if not _anexoValido(anexo):
                     continue
-                nome = _nomeSeguro(anexo.FileName)
-                chave = f"{mensagem.EntryID}|{nome}|{anexo.Size}"
+                nome = _nomeSeguro(anexo.nome)
+                chave = f"{mensagem.id}|{nome}|{anexo.tamanho}"
                 tmp_salvo = None
                 try:
-                    if chave in manifesto and os.path.exists(manifesto[chave]):
-                        caminho, ja_salvo = manifesto[chave], True
+                    arquivo_salvo = extratos_drive.arquivoDeTexto(manifesto[chave]) if chave in manifesto else None
+                    if arquivo_salvo is not None:
+                        caminho, ja_salvo = arquivo_salvo, True
                     else:
-                        # salva numa pasta temporária; só depois de identificar o fundo vai para o destino
-                        tmp = os.path.join(pasta_mes, "_tmp")
-                        os.makedirs(tmp, exist_ok=True)
-                        tmp_salvo = caminho = os.path.join(tmp, f"{os.getpid()}_{nome}")
-                        anexo.SaveAsFile(caminho)
+                        # baixa para um temporário; só depois de identificar o fundo vai para o Drive
+                        tmp_salvo = caminho = os.path.join(tempfile.gettempdir(), f"extratos_{os.getpid()}_{mensagem.id}_{nome}")
+                        with open(caminho, "wb") as arquivo_anexo:
+                            arquivo_anexo.write(email_gmail.baixarAnexo(servico, mensagem.id, anexo.id))
                         ja_salvo = False
 
                     ordem_item = _escolherItem(itens, candidatos, nome, caminho)
 
                     if not ja_salvo:
                         fundo = _fundoDoAnexo(itens[ordem_item], nome, mensagem, caminho)
-                        destino = _moverParaPasta(caminho, pasta_mes, fundo, nome)
+                        destino = _guardarNoDrive(caminho, nm_mes, fundo, nome, evitar_duplicata=True)
                         tmp_salvo = None
-                        manifesto[chave] = destino
+                        manifesto[chave] = destino.paraTexto()
                         caminho = destino
                         novos += 1
                     elif _emPastaSemFundo(caminho):
                         # já salvo numa pasta de revisão: tenta de novo com as regras atuais
                         fundo = _fundoIdentificado(itens[ordem_item], nome, mensagem, caminho)
                         if fundo:
-                            destino = _moverParaPasta(caminho, pasta_mes, fundo, nome, evitar_duplicata=True)
-                            manifesto[chave] = caminho = destino
+                            destino = _moverNoDrive(caminho, nm_mes, fundo)
+                            manifesto[chave] = destino.paraTexto()
+                            caminho = destino
                 except Exception as erro:
                     falhas.append(f"{nome}: {erro}")
                     if tmp_salvo and os.path.exists(tmp_salvo):
@@ -781,14 +897,14 @@ def conferirRespostas(itens, desde, data_ref, pasta_mes):
                     continue
 
                 # só conta o que foi realmente salvo; conta por cotista identificado no anexo
-                pasta_fundo = os.path.basename(os.path.dirname(caminho))  # fundo em que o anexo foi guardado
+                pasta_fundo = _pastaDoArquivo(caminho)  # pasta em que o anexo foi guardado
                 achados = _cotistasCobertos(itens[ordem_item], nome, caminho, pasta_fundo if pasta_fundo in itens[ordem_item]["fundos"] else None)
                 if achados:
                     cobertos.setdefault(ordem_item, set()).update(achados)
                 else:
                     sem_ident[ordem_item] = sem_ident.get(ordem_item, 0) + 1
-        with open(manifesto_path, "w", encoding="utf-8") as arquivo:
-            json.dump(manifesto, arquivo, ensure_ascii=False, indent=1)
+        if not MODO_TESTE:  # a tela de teste não grava no banco
+            salvarAnexosSalvos(nm_mes, manifesto, PASTA_EXTRATOS)
 
         recebidos = {}
         for ordem_item in set(cobertos) | set(sem_ident):
@@ -796,15 +912,13 @@ def conferirRespostas(itens, desde, data_ref, pasta_mes):
             recebidos[ordem_item] = max(1, min(n_cot, len(cobertos.get(ordem_item, ())) + sem_ident.get(ordem_item, 0)))
         return recebidos, novos, falhas
     except Exception as erro:
-        st.error(f"Não foi possível procurar as respostas no Outlook: {erro}")
+        st.error(f"Não foi possível procurar as respostas no Gmail: {erro}")
         return None
-    finally:
-        pythoncom.CoUninitialize()
 
 
 def fazerConferencia(rodada, pasta_mes):
-    """Consulta o Outlook (envios e respostas) e guarda o resultado na sessão. True se deu certo."""
-    status = conferirEnvios(rodada["itens"], rodada["inicio"])
+    """Consulta o Gmail (envios e respostas) e guarda o resultado na sessão. True se deu certo."""
+    status = conferirEnvios(rodada["itens"], rodada["inicio"], rodada["data"])
     resposta_http = conferirRespostas(rodada["itens"], rodada["inicio"], rodada["data"], pasta_mes) if status is not None else None
     if status is None:
         return False
@@ -823,7 +937,7 @@ UNIDADES_REENVIO = {"horas": 1, "dias": 24, "semanas": 168}
 
 
 def reenviarSemResposta(rodada, pasta_mes, intervalo):
-    """Confere o Outlook e reenvia (de fato envia) os e-mails já enviados que seguem sem extrato
+    """Confere o Gmail e reenvia (de fato envia) os e-mails já enviados que seguem sem extrato
     há mais que o intervalo. Retorna quantos foram reenviados, ou None se a conferência falhou."""
     if not fazerConferencia(rodada, pasta_mes):
         return None
@@ -842,7 +956,7 @@ def reenviarSemResposta(rodada, pasta_mes, intervalo):
             devidos.append(ordem_item)
     if not devidos:
         return 0
-    qt_reenviados = abrirEmailsOutlook([rodada["itens"][ordem_item] for ordem_item in devidos], rodada["data"], enviar=True)
+    qt_reenviados = enviarEmailsGmail([rodada["itens"][ordem_item] for ordem_item in devidos], rodada["data"])
     for ordem_item in devidos:
         reenvios[ordem_item] = agora
     try:
@@ -853,128 +967,67 @@ def reenviarSemResposta(rodada, pasta_mes, intervalo):
 
 
 def contarNaPasta(itens, pasta_mes):
-    """{indice: cotistas recebidos} a partir dos arquivos nas pastas dos fundos, inclusive os colocados à mão."""
+    """{indice: cotistas recebidos} a partir dos arquivos nas pastas dos fundos no Drive, inclusive os colocados à mão.
+    Só olha as pastas que já existem (não cria nada só para contar)."""
     recebidos = {}
-    for ordem_item, elemento in enumerate(itens):
-        cobertos, sem_ident = set(), 0
-        for fundo in elemento["fundos"]:
-            pasta = os.path.join(pasta_mes, _nomeSeguro(fundo)) if fundo else ""
-            if not pasta or not os.path.isdir(pasta):
-                continue
-            for nome in sorted(os.listdir(pasta)):
-                caminho = os.path.join(pasta, nome)
-                if not os.path.isfile(caminho):
-                    continue
-                achados = _cotistasCobertos(elemento, nome, caminho, fundo)
-                if achados:
-                    cobertos |= achados
-                else:
-                    sem_ident += 1
-        total = len(cobertos) + sem_ident
-        if total:
-            n_cot = sum(len(cotistas_fundo) for cotistas_fundo in elemento["fundos"].values())
-            recebidos[ordem_item] = max(1, min(n_cot, total))
+    try:
+        login = extratos_drive.loginAtual()
+        id_mes = extratos_drive.idPastaDoMes(login, int(pasta_mes[:4]), int(pasta_mes[5:7]))
+        if not id_mes:
+            return recebidos
+        lista_pastas_item, dict_arquivos = [], {}
+        for elemento in itens:
+            dict_pastas = {}  # pasta -> fundos do item que caem nela (uma pasta pode servir a mais de um fundo)
+            for fundo in elemento["fundos"]:
+                id_pasta = extratos_drive.idPastaDoFundo(login, id_mes, fundo) if fundo else None
+                if id_pasta:
+                    dict_pastas.setdefault(id_pasta, []).append(fundo)
+                    if id_pasta not in dict_arquivos:
+                        dict_arquivos[id_pasta] = extratos_drive.listarArquivos(login, id_pasta)
+            lista_pastas_item.append(dict_pastas)
+        extratos_drive.prepararTextos(login, [extratos_drive.ArquivoSalvo(dict_arquivo["id"], dict_arquivo["nome"], "", dict_arquivo["modificado"])
+                                              for lista_arquivos in dict_arquivos.values() for dict_arquivo in lista_arquivos])
+        for ordem_item, elemento in enumerate(itens):
+            cobertos, sem_ident = set(), 0
+            for id_pasta, lista_fundos in lista_pastas_item[ordem_item].items():
+                so_fundo = lista_fundos[0] if len(lista_fundos) == 1 else None
+                for dict_arquivo in sorted(dict_arquivos[id_pasta], key=lambda dict_item: dict_item["nome"]):
+                    arquivo = extratos_drive.ArquivoSalvo(dict_arquivo["id"], dict_arquivo["nome"], "", dict_arquivo["modificado"])
+                    achados = _cotistasCobertos(elemento, dict_arquivo["nome"], arquivo, so_fundo)
+                    if achados:
+                        cobertos |= achados
+                    else:
+                        sem_ident += 1
+            total = len(cobertos) + sem_ident
+            if total:
+                n_cot = sum(len(cotistas_fundo) for cotistas_fundo in elemento["fundos"].values())
+                recebidos[ordem_item] = max(1, min(n_cot, total))
+    except extratos_drive.ERROS_DRIVE as erro:
+        st.warning(f"Não consegui contar os arquivos no Drive: {extratos_drive.textoErro(erro)}")
     return recebidos
 
 
-@st.cache_resource
-def iniciarVigia(pasta):
-    """Vigia a pasta do mês (watchdog) e conta os eventos de arquivo; a tela compara o contador para se atualizar."""
-    estado = {"n": 0}
-    if Observer is None:
-        return estado
-    os.makedirs(pasta, exist_ok=True)
-
-    class _Vigia(FileSystemEventHandler):
-        def _tocou(self, registro_evento):
-            caminho = str(getattr(registro_evento, "dest_path", "") or registro_evento.src_path)
-            if registro_evento.is_directory or f"{os.sep}_tmp{os.sep}" in caminho or caminho.endswith("_salvos.json"):
-                return
-            estado["n"] += 1
-
-        on_created = on_moved = on_deleted = _tocou
-
+def assinaturaDoMes(pasta_mes):
+    """Muda quando chega, sai ou é alterado um arquivo no Drive do mês (inclusive os colocados à mão)."""
     try:
-        obs = Observer()
-        obs.daemon = True
-        obs.schedule(_Vigia(), pasta, recursive=True)
-        obs.start()
-    except Exception:
-        pass
-    return estado
-
-
-def _dirRodadas():
-    return os.path.join(PASTA_EXTRATOS, "_rodadas")
+        return extratos_drive.assinaturaDoMes(extratos_drive.loginAtual(), int(pasta_mes[:4]), int(pasta_mes[5:7]))
+    except extratos_drive.ERROS_DRIVE:
+        return "erro"
 
 
 def salvarRodada(rodada, encerrada=False):
-    """Guarda a rodada em disco para retomar a conferência em outro dia."""
-    os.makedirs(_dirRodadas(), exist_ok=True)
-    # data+hora de abertura no nome: refazer a rodada da mesma data não sobrescreve a anterior
-    caminho = rodada.get("arquivo") or os.path.join(
-        _dirRodadas(), f"{rodada['data']:%Y-%m-%d}_{rodada['inicio']:%H%M%S}.json"
-    )
-    dados = {
-        "inicio": rodada["inicio"].isoformat(),
-        "data": rodada["data"].isoformat(),
-        "encerrada": encerrada,
-        "reenvios": {str(chave_item): dt_reenvio.isoformat() for chave_item, dt_reenvio in rodada.get("reenvios", {}).items()},
-        "itens": [
-            {
-                "emails": elemento["emails"],
-                "linhas": elemento["linhas"],
-                "cnpjs": elemento["cnpjs"],
-                "fundos": [[nm_fundo_item, [list(cotista) for cotista in cots]] for nm_fundo_item, cots in elemento["fundos"].items()],
-            }
-            for elemento in rodada["itens"]
-        ],
-    }
-    with open(caminho, "w", encoding="utf-8") as arquivo:
-        json.dump(dados, arquivo, ensure_ascii=False, indent=1)
-    rodada["arquivo"] = caminho
+    """Guarda a rodada no banco para retomar a conferência em outro dia."""
+    if MODO_TESTE:  # a rodada de teste não vai para o banco
+        return
+    salvarRodadaBanco(rodada, encerrada)
 
 
 def carregarUltimaRodada():
     """Retorna a rodada aberta mais recente (ou None) e quantas outras rodadas abertas existem."""
-    pasta = _dirRodadas()
-    if not os.path.isdir(pasta):
-        return None, 0
-    arquivos = sorted(
-        (os.path.join(pasta, nm_arquivo) for nm_arquivo in os.listdir(pasta) if nm_arquivo.endswith(".json")),
-        key=os.path.getmtime,
-        reverse=True,
-    )
-    escolhida, outras = None, 0
-    for caminho in arquivos:
-        try:
-            with open(caminho, encoding="utf-8") as arquivo:
-                dict_rodada = json.load(arquivo)
-            if dict_rodada.get("encerrada"):
-                continue
-            if escolhida is not None:
-                outras += 1
-                continue
-            itens = [
-                {
-                    "emails": ordem_item["emails"],
-                    "linhas": ordem_item["linhas"],
-                    "cnpjs": ordem_item["cnpjs"],
-                    "fundos": OrderedDict((fu, [tuple(cotista) for cotista in cots]) for fu, cots in ordem_item["fundos"]),
-                }
-                for ordem_item in dict_rodada["itens"]
-            ]
-            for elemento in itens:
-                elemento["invalidos"] = [email for email in listaEmails(elemento["emails"]) if not EMAIL_RE.match(email)]
-            escolhida = {
-                "inicio": datetime.fromisoformat(dict_rodada["inicio"]),
-                "data": datetime.fromisoformat(dict_rodada["data"]).date(),
-                "itens": itens,
-                "arquivo": caminho,
-                "reenvios": {int(chave_item): datetime.fromisoformat(dt_reenvio) for chave_item, dt_reenvio in dict_rodada.get("reenvios", {}).items()},
-            }
-        except Exception:
-            continue
+    escolhida, outras = carregarRodadaAberta()
+    if escolhida:
+        for elemento in escolhida["itens"]:
+            elemento["invalidos"] = [email for email in listaEmails(elemento["emails"]) if not EMAIL_RE.match(email)]
     return escolhida, outras
 
 
@@ -993,18 +1046,46 @@ data = st.session_state.get("data_ref")
 
 from app.utilitarias.tema import topo
 
-topo("Solicitação de extratos", "Gere os e-mails de extratos direto no Outlook e envie", app="extratos")
+topo("Solicitação de extratos", "Gere os e-mails de extratos direto no Gmail e envie", app="extratos")
+modo_teste.alinharModo(MODO_TESTE)  # trocar entre a tela real e a de teste limpa o que era do outro modo
+if MODO_TESTE:
+    try:
+        ds_link_teste = extratos_drive.linkDaPasta(extratos_drive.idRaiz())
+    except extratos_drive.ERROS_DRIVE:
+        ds_link_teste = ""
+    modo_teste.mostrarFaixa(ds_link_teste)
+mostrarResultadoEnvio()
 
-if not os.path.exists(ARQUIVO):
-    st.error(f"Não encontrei '{os.path.basename(ARQUIVO)}'. Coloque a planilha na mesma pasta do app.py e recarregue a página.")
+# Áreas da página. A importação fica antes de ler o cadastro: funciona também com o cadastro vazio.
+nm_area = st.radio("Área", ["Solicitar extratos", "Importar cadastro", "Apagar cadastros"], horizontal=True, key="area_extratos",
+                   label_visibility="collapsed")
+if MODO_TESTE and nm_area != "Solicitar extratos":
+    st.info("Importar e apagar cadastros mexem no banco de verdade, por isso não funcionam na tela de teste.")
+    st.stop()
+if nm_area == "Importar cadastro":
+    abaImportar()
+    st.stop()
+if nm_area == "Apagar cadastros":
+    abaApagar()
     st.stop()
 
-mtime = os.path.getmtime(ARQUIVO)
-df, originais = carregarPlanilha(ARQUIVO, mtime)
+try:
+    if MODO_TESTE:
+        df, originais = _mapearColunas(modo_teste.cadastroFicticio())
+        dt_consulta = datetime.now()
+    else:
+        df, originais, dt_consulta = carregarPlanilha(obterVersaoCadastro())
+except Exception as erro:
+    st.error(f"Não foi possível ler o cadastro de fundos no banco de dados: {erro}")
+    st.stop()
+
+if df.empty:
+    st.error("O cadastro de fundos (tabela tb_extratos_fundo_cotista) está vazio.")
+    st.stop()
 
 faltando = [rotulo for campo, rotulo in OBRIGATORIAS.items() if campo not in df.columns]
 if faltando:
-    st.error(f"Faltam colunas na planilha: {', '.join(faltando)}.")
+    st.error(f"Faltam colunas no cadastro de fundos: {', '.join(faltando)}.")
     st.caption(f"Colunas encontradas: {', '.join(originais)}")
     st.stop()
 
@@ -1052,39 +1133,17 @@ with esq:
         st.write("")
 
         if st.button(
-            f"Abrir todos ({len(validos)})",
+            f"Revisar e enviar ({len(validos)})",
             type="primary",
             use_container_width=True,
             disabled=data is None or not validos,
         ):
-            st.session_state["confirmar_todos"] = True
+            dialogoRevisarEnvio(validos, data, None, sem_email)
 
         if data is None:
             st.caption("Escolha a data para liberar os botões de envio.")
         elif validos:
-            st.caption(f"{len(validos)} e-mails serão abertos no Outlook, um por destinatário. Você revisa e envia cada um.")
-
-        if st.session_state.get("confirmar_todos") and not (data and validos):
-            st.session_state["confirmar_todos"] = False
-
-        if st.session_state.get("confirmar_todos"):
-            aviso = f"O Outlook vai abrir {len(validos)} janelas de e-mail."
-            if sem_email:
-                aviso += f" {sem_email} sem e-mail cadastrado ficam de fora."
-            st.warning(aviso)
-            b1, b2 = st.columns(2)
-            if b1.button("Sim, abrir", key="confirma", type="primary", use_container_width=True):
-                st.session_state["confirmar_todos"] = False
-                inicio = datetime.now()
-                abertos = abrirEmailsOutlook(validos, data)
-                if abertos:
-                    st.session_state["rodada"] = {"inicio": inicio, "data": data, "itens": validos}
-                    salvarRodada(st.session_state["rodada"])
-                    st.session_state.pop("conferencia", None)
-                    st.toast(f"{abertos} e-mails abertos no Outlook.")
-            if b2.button("Cancelar", key="cancela", use_container_width=True):
-                st.session_state["confirmar_todos"] = False
-                st.rerun()
+            st.caption(f"{len(validos)} e-mails: você revisa todos numa tela e envia de uma vez, sem abrir rascunhos.")
 
 # ---------- Lista ----------
 with dir_:
@@ -1130,10 +1189,10 @@ with dir_:
                 unsafe_allow_html=True,
             )
 
-        st.caption(f"Planilha {os.path.basename(ARQUIVO)}, atualizada em {datetime.fromtimestamp(mtime):%d/%m/%Y %H:%M}.")
+        st.caption(f"Cadastro de fundos (banco de dados), consultado em {dt_consulta:%d/%m/%Y %H:%M}.")
 
 # ---------- Conferência de envios e respostas ----------
-if "rodada" not in st.session_state and not st.session_state.get("rodada_carregada"):
+if "rodada" not in st.session_state and not st.session_state.get("rodada_carregada") and not MODO_TESTE:
     st.session_state["rodada_carregada"] = True
     _retomada, _outras = carregarUltimaRodada()
     if _retomada:
@@ -1145,18 +1204,17 @@ if not rodada:
     st.write("")
     st.markdown(
         '<div class="vazio"><b>Conferência de envios e respostas</b>'
-        "Ela aparece aqui depois que você abrir os e-mails no Outlook.</div>",
+        "Ela aparece aqui depois que você criar os e-mails no Gmail.</div>",
         unsafe_allow_html=True,
     )
 if rodada:
     st.write("")
-    pasta_mes = os.path.join(PASTA_EXTRATOS, rodada["data"].strftime("%Y-%m"))
-    vigia = iniciarVigia(pasta_mes)
+    pasta_mes = rodada["data"].strftime("%Y-%m")  # o mês da data de referência decide a pasta do Drive (ex.: 2026-10 -> 2026/10- Outubro)
     conf = st.session_state.get("conferencia")
     pend = []
     if conf:
-        # soma ao que veio do Outlook os arquivos que estão nas pastas (inclusive os colocados à mão)
-        chave_disco = (pasta_mes, vigia["n"], conf["hora"])
+        # soma ao que veio do Gmail os arquivos que estão nas pastas (inclusive os colocados à mão)
+        chave_disco = (pasta_mes, assinaturaDoMes(pasta_mes), conf["hora"])
         if st.session_state.get("disco_chave") != chave_disco:
             st.session_state["disco"] = contarNaPasta(rodada["itens"], pasta_mes)
             st.session_state["disco_chave"] = chave_disco
@@ -1179,21 +1237,23 @@ if rodada:
         )
         b1, b2, b3, b4 = st.columns(4)
         if b1.button("Conferir envios e respostas", key="conferir", type="primary", use_container_width=True):
-            with st.spinner("Consultando o Outlook..."):
+            with st.spinner("Consultando o Gmail..."):
                 ok = fazerConferencia(rodada, pasta_mes)
             if ok:
                 st.rerun()
 
-        if b2.button(f"Reabrir pendentes ({len(pend)})", key="reabrir", disabled=not pend, use_container_width=True):
-            if abrirEmailsOutlook([rodada["itens"][ordem_item] for ordem_item in pend], rodada["data"]):
-                st.toast("E-mails pendentes abertos no Outlook.")
+        if b2.button(f"Reenviar pendentes ({len(pend)})", key="reabrir", disabled=not pend, use_container_width=True):
+            dialogoRevisarEnvio([rodada["itens"][ordem_item] for ordem_item in pend], rodada["data"], rodada)
 
-        if b3.button("Abrir pasta dos extratos", key="pasta", use_container_width=True):
-            try:
-                os.makedirs(pasta_mes, exist_ok=True)
-                os.startfile(pasta_mes)
-            except (AttributeError, OSError) as erro:
-                st.error(f"Não foi possível abrir a pasta: {erro}")
+        try:
+            id_pasta_mes = extratos_drive.idPastaDoMes(extratos_drive.loginAtual(), int(pasta_mes[:4]), int(pasta_mes[5:7]))
+        except extratos_drive.ERROS_DRIVE:
+            id_pasta_mes = None
+        if id_pasta_mes:
+            b3.link_button("Abrir pasta no Drive", extratos_drive.linkDaPasta(id_pasta_mes), use_container_width=True)
+        else:
+            b3.button("Abrir pasta no Drive", key="pasta", disabled=True, use_container_width=True,
+                      help="A pasta deste mês ainda não existe no Drive: ela é criada quando chegar o primeiro extrato.")
 
         if b4.button("Encerrar rodada", key="encerrar", use_container_width=True):
             try:
@@ -1208,7 +1268,7 @@ if rodada:
         auto = a1.checkbox(
             "Conferir automaticamente",
             key="auto_conf",
-            help="Com o app aberto, consulta o Outlook sozinho no intervalo escolhido e salva as respostas.",
+            help="Com o app aberto, consulta o Gmail sozinho no intervalo escolhido e salva as respostas.",
         )
         minutos = a2.selectbox(
             "Intervalo", [5, 10, 15, 30], key="auto_min", disabled=not auto,
@@ -1222,7 +1282,7 @@ if rodada:
                 conferencia_atual = st.session_state.get("conferencia")
                 desde = conferencia_atual["hora"] if conferencia_atual else rodada["inicio"]
                 if datetime.now() - desde >= timedelta(minutes=minutos):
-                    with st.spinner("Conferindo automaticamente no Outlook..."):
+                    with st.spinner("Conferindo automaticamente no Gmail..."):
                         ok = fazerConferencia(rodada, pasta_mes)
                     if ok:
                         st.rerun()
@@ -1233,7 +1293,7 @@ if rodada:
         reenviar = r1.checkbox(
             "Reenviar automaticamente quem não respondeu",
             key="auto_reenvio",
-            help="Com o app aberto, a cada intervalo confere o Outlook e reenvia o e-mail a quem já recebeu "
+            help="Com o app aberto, a cada intervalo confere o Gmail e reenvia o e-mail a quem já recebeu "
             "mas ainda não mandou o extrato. Os e-mails são enviados direto, sem abrir para revisão.",
         )
         qtd = r2.number_input(
@@ -1265,19 +1325,20 @@ if rodada:
 
             st.fragment(run_every=timedelta(minutes=1))(_checarReenvio)()
 
-        # vigia da pasta: atualiza a tela quando chega ou sai arquivo (também os colocados à mão)
+        # vigia da pasta: a cada minuto confere o Drive e atualiza a tela quando chega ou sai arquivo (também os colocados à mão)
         def _vigiar():
             chave_item = f"vigia_{pasta_mes}"
-            visto = st.session_state.setdefault(chave_item, vigia["n"])
-            if vigia["n"] != visto:
-                st.session_state[chave_item] = vigia["n"]
+            assinatura = assinaturaDoMes(pasta_mes)
+            visto = st.session_state.setdefault(chave_item, assinatura)
+            if assinatura != visto:
+                st.session_state[chave_item] = assinatura
                 st.rerun()
 
-        st.fragment(run_every="3s")(_vigiar)()
+        st.fragment(run_every="60s")(_vigiar)()
 
         if st.session_state.get("rodadas_outras"):
             st.caption(
-                f"Há outras {st.session_state['rodadas_outras']} rodada(s) antiga(s) abertas em Extratos/_rodadas. "
+                f"Há outras {st.session_state['rodadas_outras']} rodada(s) antiga(s) abertas. "
                 "Esta é a mais recente; encerre as que não usa mais."
             )
 
@@ -1288,7 +1349,7 @@ if rodada:
             )
 
         if conf:
-            classes = {"Enviado": "ok", "Erro de entrega": "sem", "Na caixa de saída": "pend", "Aguardando envio": "pend"}
+            classes = {"Enviado": "ok", "Erro de entrega": "sem", "Em rascunho": "pend", "Aguardando envio": "pend"}
             total = len(rodada["itens"])
             enviados = sum(1 for status_envio in conf["status"].values() if status_envio == "Enviado")
             def _falta(chave_item, elemento_aux):
@@ -1345,15 +1406,14 @@ if rodada:
                     # botão individual: só para e-mails não enviados (ou com erro) e sem extrato recebido
                     if stt in ("Aguardando envio", "Erro de entrega") and not rec:
                         if cols[5].button("Reenviar", key=f"reenviar_{ordem_item}", use_container_width=True):
-                            if abrirEmailsOutlook([elemento], rodada["data"]):
-                                st.toast("E-mail aberto no Outlook.")
+                            dialogoRevisarEnvio([elemento], rodada["data"], rodada)
                     else:
                         cols[5].markdown('<span class="ativo">-</span>', unsafe_allow_html=True)
                     st.markdown('<div class="sep"></div>', unsafe_allow_html=True)
             st.caption(
-                f"Arquivos salvos em {pasta_mes}, uma pasta por fundo. Em e-mails com mais de um fundo, o fundo é "
+                f"Arquivos salvos no Drive (BO_Extratos Mensais, pasta do mês {pasta_mes}), uma pasta por fundo. Em e-mails com mais de um fundo, o fundo é "
                 "identificado pelo nome do arquivo, pelo conteúdo do PDF, pelo assunto ou pelo corpo da resposta; "
                 "se nada identificar, o anexo vai para uma pasta com o nome do remetente. O extrato é reconhecido em "
-                "respostas com anexo na Caixa de Entrada padrão, pelo remetente ou pelo assunto. Na caixa de saída "
-                "não entra em 'Reabrir pendentes', para evitar e-mail duplicado."
+                "respostas com anexo na Caixa de Entrada do Gmail, pelo remetente ou pelo assunto. Quem já tem rascunho "
+                "no Gmail não entra em 'Reenviar pendentes', para evitar e-mail duplicado."
             )

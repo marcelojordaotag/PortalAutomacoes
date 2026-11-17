@@ -27,7 +27,12 @@ def tratarHtml(tabela):
 
 def lerGrid(arquivo, coluna_id):
     """Lê o Excel exportado e valida a coluna de ID. Levanta ValueError com mensagem amigável."""
-    tabela = tratarHtml(pd.read_excel(arquivo))
+    return validarGrid(pd.read_excel(arquivo), coluna_id)
+
+
+def validarGrid(tabela, coluna_id):
+    """Trata o HTML da tabela já carregada e valida a coluna de ID. Levanta ValueError com mensagem amigável."""
+    tabela = tratarHtml(tabela)
     if coluna_id not in tabela.columns:
         raise ValueError(f"Não achei a coluna \"{coluna_id}\" neste arquivo. Colunas encontradas: {', '.join(map(str, tabela.columns))}.")
     tabela[coluna_id] = pd.to_numeric(tabela[coluna_id], errors="coerce")
@@ -76,17 +81,42 @@ def pendencias(grid3, grid4):
 
 def resumoProblemas(tabela):
     """"6 sem cota no Grid 4" / "2 não estão no Grid 3 · 1 com Valor Cota vazio": o que a tabela mostra sem coluna de problema."""
-    nomes = {"Não está no Grid 3": "não estão no Grid 3", "Sem cota no Grid 4": "sem cota no Grid 4", "Valor Cota vazio": "com Valor Cota vazio"}
+    nomes = {"Não está no Grid 3": "não estão no cadastro", "Sem cota no Grid 4": "sem cota", "Valor Cota vazio": "com Valor Cota vazio"}
     contagem = tabela["Problema"].value_counts()
     return " · ".join(f"{contagem[problema]} {nome}" for problema, nome in nomes.items() if problema in contagem)
 
 
-def mensagensSlackGrids(grid3, grid4, data):
+def feriadosBrasil(anos):
+    """Feriados nacionais (fixos e os que dependem da Páscoa), como no calendário ANBIMA."""
+    from datetime import date, timedelta
+    from dateutil.easter import easter
+
+    datas = []
+    for ano in anos:
+        pascoa = easter(ano)
+        datas += [date(ano, mes, dia) for mes, dia in [(1, 1), (4, 21), (5, 1), (9, 7), (10, 12), (11, 2), (11, 15), (12, 25)]]
+        if ano >= 2024:
+            datas.append(date(ano, 11, 20))
+        datas += [pascoa - timedelta(days=48), pascoa - timedelta(days=47), pascoa - timedelta(days=2), pascoa + timedelta(days=60)]
+    return datas
+
+
+def rotuloD(data, hoje=None):
+    """"D-1", "D-2"...: dias úteis (sem fins de semana e feriados) entre a data das cotas e hoje."""
+    import numpy as np
+    from datetime import date
+
+    hoje = hoje or date.today()
+    feriados = feriadosBrasil(range(min(data, hoje).year, max(data, hoje).year + 1))
+    return f"D-{max(int(np.busday_count(data, hoje, holidays=feriados)), 0)}"
+
+
+def mensagensSlackGrids(grid3, grid4, data, dia):
     """Uma mensagem com a tabela de pendências (o Slack aceita uma tabela por mensagem; mais de 99 linhas viram mais mensagens)."""
     from app.paginas.crava_cotas.slack_crava import celulaSlack
 
     tabela = pendencias(grid3, grid4)
-    cabecalho = f"*CRAVA COTAS: conferência Britech de {data:%d/%m/%Y}*"
+    cabecalho = f"*CRAVA COTAS: conferência Britech de {data:%d/%m/%Y} ({dia})*"
     if tabela.empty:
         return [{"texto": f"{cabecalho}: tudo certo, nenhuma pendência.", "tabela": None}]
     tabela = tabela.drop(columns="Problema")

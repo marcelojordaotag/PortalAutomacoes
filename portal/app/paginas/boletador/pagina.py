@@ -1,14 +1,12 @@
 import html
 import io
-import json
 import re
-import shutil
 import subprocess
 import sys
 import time
 import unicodedata
 from collections import defaultdict
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -16,7 +14,15 @@ import plotly.express as px
 import streamlit as st
 from streamlit.errors import StreamlitAPIException
 
-from app.ambiente.config_ambiente import obterDiretorioDados
+from app.database.boletador import (
+    atualizarCard as atualizarCardBanco,
+    criarCard as criarCardBanco,
+    excluirCard as excluirCardBanco,
+    gravarSnapshotAta,
+    listarCards,
+    obterSnapshotAta,
+    registrarOcorrencia as registrarOcorrenciaBanco,
+)
 from app.paginas.boletador.importador import MARCADOR_ARQUIVO, TEMPO_MAX_LOGIN
 from app.utilitarias.tema import COR, CORES_PRIORIDADE, CSS_ERROS, aplicarTema, estilizarFigura, topo
 
@@ -447,9 +453,6 @@ def estadoVazio(titulo, descricao):
 
 
 # --- INÍCIO CONTROLE DE ERROS -----------------------------------------------
-URL_BOLETADOR_LOGIN = "https://boletador-hom.taginvest.com.br/boleta-cf"
-ARQUIVO_ERROS = obterDiretorioDados("boletador") / "controle_erros.json"
-ARQUIVO_SNAPSHOT = obterDiretorioDados("boletador") / "snapshot_ata.json"
 COLUNAS_ERROS = ["Problemas / Gargalos", "Solucionados"]
 COL_SOLUCIONADOS = COLUNAS_ERROS[-1]
 PRIORIDADES = ["Baixa", "Média", "Alta", "Crítica"]
@@ -488,81 +491,21 @@ def hoje():
 
 
 def carregarErros():
-    if not ARQUIVO_ERROS.exists():
-        return []
-    try:
-        cards = json.loads(ARQUIVO_ERROS.read_text(encoding="utf-8"))
-        for card in cards:
-            if card.get("coluna") not in COLUNAS_ERROS:  # colunas antigas (Em análise / Em tratamento) voltam para a primeira
-                card["coluna"] = COLUNAS_ERROS[0]
-        return cards
-    except json.JSONDecodeError:
-        # arquivo corrompido: guarda uma cópia e começa limpo, sem perder o original
-        ARQUIVO_ERROS.replace(ARQUIVO_ERROS.with_name("controle_erros_corrompido.json"))
-        return []
-
-
-PASTA_BACKUP = obterDiretorioDados("boletador") / "backups_erros"
-MAX_BACKUPS = 30  # quantos dias de backup manter
-
-
-def fazerBackupDiario():
-    """Copia o controle_erros.json para backups_erros/ uma vez por dia (estado do início do dia)."""
-    if not ARQUIVO_ERROS.exists():
-        return
-    destino = PASTA_BACKUP / f"controle_erros_{datetime.now():%Y-%m-%d}.json"
-    if destino.exists():
-        return
-    try:
-        PASTA_BACKUP.mkdir(exist_ok=True)
-        shutil.copy2(ARQUIVO_ERROS, destino)
-        for antigo in sorted(PASTA_BACKUP.glob("controle_erros_*.json"))[:-MAX_BACKUPS]:
-            antigo.unlink()
-    except OSError:
-        pass  # o backup nunca pode impedir o salvamento
-
-
-def salvarErros(cards):
-    fazerBackupDiario()
-    tmp = ARQUIVO_ERROS.with_name("controle_erros.tmp")
-    tmp.write_text(json.dumps(cards, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(ARQUIVO_ERROS)
+    cards = listarCards()  # erro de banco sobe como exceção (nunca vira lista vazia)
+    for card in cards:
+        if card.get("coluna") not in COLUNAS_ERROS:  # colunas antigas (Em análise / Em tratamento) voltam para a primeira
+            card["coluna"] = COLUNAS_ERROS[0]
+    return cards
 
 
 def criarCard(titulo, descricao, prioridade, ocorrencias,
     categoria = SEM_CATEGORIA, causa_raiz = "",
 ):
-    cards = carregarErros()
-    cards.append({
-        "id": max((card["id"] for card in cards), default=0) + 1,
-        "titulo": titulo.strip(),
-        "descricao": descricao.strip(),
-        "coluna": COLUNAS_ERROS[0],
-        "prioridade": prioridade,
-        "ocorrencias": int(ocorrencias),
-        "solucao": "",
-        "categoria": categoria,
-        "causa_raiz": causa_raiz.strip(),
-        "conexoes": [],
-        "historico": [{"data": agora(), "qtd": int(ocorrencias), "nota": "Registro inicial"}],
-        "criado_em": agora(),
-        "atualizado_em": agora(),
-        "ultima_ocorrencia": hoje(),
-    })
-    salvarErros(cards)
+    criarCardBanco(titulo, descricao, prioridade, ocorrencias, categoria, causa_raiz, COLUNAS_ERROS[0])
 
 
 def atualizarCard(card_id, **campos):
-    cards = carregarErros()
-    for card in cards:
-        if card["id"] == card_id:
-            card.update(campos)
-            card["atualizado_em"] = agora()
-            if card["coluna"] == COL_SOLUCIONADOS:
-                card.setdefault("resolvido_em", agora())
-            else:
-                card.pop("resolvido_em", None)
-    salvarErros(cards)
+    atualizarCardBanco(card_id, campos, COL_SOLUCIONADOS)
 
 
 FORMATO_DATA_HORA = "%d/%m/%Y %H:%M"
@@ -581,24 +524,11 @@ def historicoDoCard(card):
 
 def registrarOcorrencia(card_id, qtd, nota):
     """Soma ocorrências ao card e registra a data e a nota na linha do tempo."""
-    cards = carregarErros()
-    for card in cards:
-        if card["id"] == card_id:
-            historico = historicoDoCard(card)  # montado antes de alterar a contagem
-            historico.append({"data": agora(), "qtd": int(qtd), "nota": nota.strip()})
-            card["historico"] = historico
-            card["ocorrencias"] = int(card["ocorrencias"]) + int(qtd)
-            card["ultima_ocorrencia"] = hoje()
-            card["atualizado_em"] = agora()
-    salvarErros(cards)
+    registrarOcorrenciaBanco(card_id, qtd, nota)
 
 
 def excluirCard(card_id):
-    restantes = [card for card in carregarErros() if card["id"] != card_id]
-    for card in restantes:  # remove as conexões que apontavam para o card excluído
-        if card_id in card.get("conexoes", []):
-            card["conexoes"] = [ordem_item for ordem_item in card["conexoes"] if ordem_item != card_id]
-    salvarErros(restantes)
+    excluirCardBanco(card_id)  # remove também as conexões que apontavam para o card excluído
 
 
 @st.dialog("Registrar ocorrência")
@@ -1038,16 +968,11 @@ def exibirGrafoErros(cards):
 
 
 def carregarSnapshotAta():
-    if not ARQUIVO_SNAPSHOT.exists():
-        return {}
-    try:
-        return json.loads(ARQUIVO_SNAPSHOT.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return {}
+    return obterSnapshotAta()
 
 
 def salvarSnapshotAta(dados):
-    ARQUIVO_SNAPSHOT.write_text(json.dumps(dados, ensure_ascii=False, indent=2), encoding="utf-8")
+    gravarSnapshotAta(dados)
 
 
 @st.dialog("Relatório para Ata de Reunião", width="large")
@@ -1091,7 +1016,6 @@ def dialogoAta():
 
 
 def abaControleErros():
-    fazerBackupDiario()
     st.markdown(CSS_ERROS, unsafe_allow_html=True)
     cards = carregarErros()
     st.markdown(kpisErrosHtml(cards), unsafe_allow_html=True)
@@ -1338,74 +1262,7 @@ with aba_conferencia:
         )
 
 with aba_liquidacao:
-    col_ini, col_fim, _ = st.columns([1, 1, 3])
-    data_inicial = col_ini.date_input("Período inicial da operação", value=date.today(), format="DD/MM/YYYY", key="liq_data_ini")
-    data_final = col_fim.date_input("Período final da operação", value=date.today(), format="DD/MM/YYYY", key="liq_data_fim")
-    aviso_liquidacao = st.empty()
-    if data_inicial > data_final:
-        st.warning("O período inicial não pode ser maior que o final.")
-    elif st.button("Baixar dados", key="btn_baixar_liquidacao"):
-        try:
-            with st.spinner("Navegador aberto. Faça o login no boletador para baixar a planilha..."):
-                resultado = subprocess.run(
-                    [sys.executable, str(Path(__file__).resolve().with_name("importador.py")), URL_BOLETADOR_LOGIN,
-                     f"{data_inicial:%d/%m/%Y}", f"{data_final:%d/%m/%Y}"],
-                    capture_output=True,
-                    text=True,
-                    timeout=TEMPO_MAX_LOGIN + 300,
-                )
-        except subprocess.TimeoutExpired:
-            aviso_liquidacao.error("O download demorou mais do que o esperado e foi interrompido.")
-            resultado = None
-
-        if resultado is not None:
-            if resultado.returncode == 0:
-                caminho = next(
-                    (
-                        linha.split(MARCADOR_ARQUIVO, 1)[1].strip()
-                        for linha in resultado.stdout.splitlines()
-                        if linha.startswith(MARCADOR_ARQUIVO)
-                    ),
-                    None,
-                )
-                if caminho:
-                    st.session_state["arquivo_liquidacao"] = caminho
-                    aviso_liquidacao.success(f"Planilha baixada com sucesso: {Path(caminho).name}")
-                else:
-                    aviso_liquidacao.warning("Download concluído, mas o caminho do arquivo não foi retornado.")
-            elif resultado.returncode == 2:
-                aviso_liquidacao.warning("Tempo esgotado: o login não foi concluído em 5 minutos.")
-            else:
-                aviso_liquidacao.warning("Houve um erro na execução ou o navegador foi fechado antes de terminar.")
-                st.code((resultado.stderr or resultado.stdout)[-1500:] or "Erro detalhado não encontrado.")
-    if not st.session_state.get("arquivo_liquidacao"):
-        estadoVazio("Controle de Liquidação", "Em breve.")
-
-with aba_liquidacao:
-    caminho_liquidacao = st.session_state.get("arquivo_liquidacao")
-    if caminho_liquidacao and Path(caminho_liquidacao).exists():
-        try:
-            if caminho_liquidacao.lower().endswith(".csv"):
-                for codificacao in ("utf-8-sig", "cp1252"):  # o boletador exporta em cp1252 (acentos)
-                    try:
-                        df_liquidacao = pd.read_csv(
-                            caminho_liquidacao, sep=None, engine="python", encoding=codificacao
-                        )
-                        break
-                    except UnicodeDecodeError:
-                        continue
-            else:
-                df_liquidacao = pd.read_excel(caminho_liquidacao)
-            if "Status" in df_liquidacao.columns:
-                opcoes_status = sorted(df_liquidacao["Status"].dropna().astype(str).unique())
-                status_escolhidos = st.multiselect(
-                    "Status", opcoes_status, default=opcoes_status, key="liq_filtro_status"
-                )
-                df_liquidacao = df_liquidacao[df_liquidacao["Status"].astype(str).isin(status_escolhidos)]
-            st.caption(f"{Path(caminho_liquidacao).name} · {len(df_liquidacao)} linhas")
-            st.dataframe(df_liquidacao, use_container_width=True, hide_index=True)
-        except Exception as erro:
-            st.error(f"A planilha foi baixada, mas não consegui exibi-la: {erro}")
+    estadoVazio("Controle de Liquidação", "Em breve.")
 
 with aba_erros:
     abaControleErros()

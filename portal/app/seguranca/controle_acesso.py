@@ -1,15 +1,16 @@
 """Login do Portal TAG: usuários e senhas próprios, gerenciados por um administrador dentro do portal.
 
-- As contas ficam em dados/portal/usuarios.json (fora do git). Para o G: compartilhado, defina a variável de
-  ambiente PORTAL_DADOS com a pasta; sem ela os dados ficam em dados/ na raiz do projeto.
+- As contas, sessões e vínculos de computador ficam no banco MySQL (tabelas tb_usuario, tb_sessao, tb_dispositivo;
+  conexão em app/database/db.py, variáveis BANCO_BKO_*).
 - Senhas nunca são guardadas: só o hash PBKDF2-SHA256 com sal individual e "pimenta" (PORTAL_SEGREDO: variável do SO,
   Parameter Store ou env/.env.segredo, que fica fora do git).
 - No primeiro acesso (sem nenhum usuário) o portal pede a criação do administrador.
 - Login persistente: ao entrar, o navegador recebe um cookie com um token aleatório; no servidor fica só o hash do
-  token (sessoes.json). Ao recarregar a página o token é validado e a pessoa continua logada, até a sessão expirar,
+  token (tabela tb_sessao). Ao recarregar a página o token é validado e a pessoa continua logada, até a sessão expirar,
   a pessoa clicar em Sair, trocar a senha ou o administrador desativá-la.
 - Uso no main.py (ponto de entrada de todas as páginas):  usuario = controle_acesso.exigir_login()
 """
+import base64
 import hashlib
 import hmac
 import html
@@ -27,7 +28,9 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 
-from app.ambiente.config_ambiente import diretorio_base, obterDiretorioDados
+from app.ambiente.config_ambiente import diretorio_base
+from app.database import seguranca as banco_seguranca
+from app.seguranca import autenticador
 from app.seguranca.registro_acessos import registrarEvento
 from app.utilitarias.tema import COR, _logoBase64, topo
 from app.utilitarias.versoes import rotulo
@@ -42,15 +45,14 @@ def _envInt(nome, padrao):
         return padrao
 
 
-PASTA_DADOS = obterDiretorioDados("portal")
-ARQ_USUARIOS = PASTA_DADOS / "usuarios.json"
-ARQ_SESSOES = PASTA_DADOS / "sessoes.json"
-ARQ_DISPOSITIVOS = PASTA_DADOS / "dispositivos.json"
-COOKIE = "portal_tag_sessao"
+COOKIE ="portal_tag_sessao"
 COOKIE_DISP = "portal_tag_disp"  # identifica este navegador/computador (longa duração, aleatório)
 
 ITERACOES = 240_000
-SENHA_MIN = 8
+SENHA_MIN = 10
+SENHAS_FRACAS = {"senha", "password", "passw0rd", "admin", "administrador", "portal", "portaltag", "tag", "taginvest",
+                 "qwerty", "qwertyuiop", "abcdefghij", "mudar", "trocar", "bemvindo", "temporaria", "changeme", "letmein"}
+trava_usuarios = threading.Lock()  # login e gravação das contas nunca se misturam (evita desfazer uma desativação)
 MAX_FALHAS = _envInt("PORTAL_MAX_FALHAS", 5)          # erros seguidos de senha antes de bloquear o usuário
 BLOQUEIO_MIN = _envInt("PORTAL_BLOQUEIO_MIN", 5)        # minutos de bloqueio
 SESSAO_MIN = _envInt("PORTAL_SESSAO_MIN", 30)       # a cada tanto tempo o portal pergunta se a pessoa ainda está ativa
@@ -60,7 +62,7 @@ PERFIS = ["usuario", "admin"]
 APPS_PORTAL = {
     "extratos": "Solicitação de extratos", "boletas": "Mesa de Boletas", "solicitacoes": "Registro de Solicitações",
     "processos_externos": "Registro Solicitações de Fechamento", "rentabilidade": "Rentabilidade e Cotas",
-    "bradesco": "Transactions Offshore", "caixa": "Conciliação de Caixa", "crava_cotas": "CRAVA COTAS",
+    "bradesco": "Transactions Offshore", "caixa": "Conciliação de Caixa", "crava_cotas": "Crava Cotas",
 }
 ROTULO_PERFIL = {"usuario": "Usuário", "admin": "Administrador"}
 CHAVE_SESSAO = "auth"
@@ -71,18 +73,21 @@ def agora():
     return datetime.now().replace(microsecond=0)
 
 
+class ErroArquivoUsuarios(Exception):
+    """O cadastro de usuários (banco de dados) não pôde ser lido: o portal para em vez de tratar como "sem contas"."""
+
+
 def carregarUsuarios():
+    """Contas cadastradas (tabela tb_usuario). Tabela vazia = primeiro acesso. Falha do banco NUNCA vira lista vazia: senão
+    qualquer visitante veria "Criar administrador" e criaria uma conta de administrador."""
     try:
-        return json.loads(ARQ_USUARIOS.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
+        return banco_seguranca.carregarUsuarios()
+    except Exception as erro:  # noqa: BLE001  (qualquer falha de banco bloqueia o portal)
+        raise ErroArquivoUsuarios(str(erro)) from erro
 
 
 def salvarUsuarios(usuarios):
-    ARQ_USUARIOS.parent.mkdir(parents=True, exist_ok=True)
-    tmp = ARQ_USUARIOS.with_suffix(".tmp")
-    tmp.write_text(json.dumps(usuarios, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(ARQ_USUARIOS)  # troca atômica: nunca deixa o arquivo pela metade
+    banco_seguranca.salvarUsuarios(usuarios)  # uma transação: ou grava tudo ou nada
 
 
 def buscar(usuarios, login):
@@ -147,6 +152,8 @@ def validarSenha(senha, confirmacao):
         return f"A senha precisa ter pelo menos {SENHA_MIN} caracteres."
     if senha.lower() == senha or senha.upper() == senha or not any(caractere.isdigit() for caractere in senha):
         return "Use letras maiúsculas e minúsculas e pelo menos um número."
+    if re.sub(r"\d+$", "", senha.lower()) in SENHAS_FRACAS:
+        return "Essa senha é muito comum. Escolha outra."
     if senha != confirmacao:
         return "A confirmação não é igual à senha."
     return None
@@ -180,40 +187,28 @@ def _hashToken(token):
     return hmac.new(segredo(), token.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _carregarSessoes():
-    try:
-        return json.loads(ARQ_SESSOES.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-
-
-def _salvarSessoes(sessoes):
-    agora_iso = agora().isoformat()
-    sessoes = [sessao for sessao in sessoes if sessao["expira_em"] > agora_iso]  # descarta as expiradas
-    ARQ_SESSOES.parent.mkdir(parents=True, exist_ok=True)
-    tmp = ARQ_SESSOES.with_suffix(".tmp")
-    tmp.write_text(json.dumps(sessoes, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(ARQ_SESSOES)
-
-
 def criarToken(login):
-    """Gera o token do navegador. Só o hash dele é guardado."""
+    """Gera o token do navegador. Só o hash dele é guardado (tabela tb_sessao)."""
     token = secrets.token_urlsafe(32)
-    sessoes = _carregarSessoes()
-    sessoes.append({
-        "hash": _hashToken(token), "usuario": login, "criado_em": agora().isoformat(),
-        "expira_em": (agora() + timedelta(minutes=SESSAO_MIN, seconds=GRACA_SEG)).isoformat(),
-    })
-    _salvarSessoes(sessoes)
+    banco_seguranca.criarSessao(
+        _hashToken(token), login, agora().isoformat(),
+        (agora() + timedelta(minutes=SESSAO_MIN, seconds=GRACA_SEG)).isoformat())
     return token
+
+
+def tokenAtivo(token):
+    """True se o token desta sessão ainda existe no servidor (troca de senha, desativação e logout o removem)."""
+    if not token:
+        return False
+    sessao = banco_seguranca.buscarSessao(_hashToken(token))
+    return bool(sessao and sessao["expira_em"] > agora().isoformat())
 
 
 def usuarioDoToken(token):
     """Valida o token do cookie. Retorna (usuário, início da sessão, ativo até) ou None se inválido/expirado/usuário inativo."""
     if not token:
         return None
-    hash_token = _hashToken(token)
-    reg = next((sessao for sessao in _carregarSessoes() if hmac.compare_digest(sessao["hash"], hash_token)), None)
+    reg = banco_seguranca.buscarSessao(_hashToken(token))
     if reg is None or reg["expira_em"] <= agora().isoformat():
         return None
     usuario = buscar(carregarUsuarios(), reg["usuario"])
@@ -225,13 +220,12 @@ def usuarioDoToken(token):
 
 def revogarToken(token):
     if token:
-        hash_token = _hashToken(token)
-        _salvarSessoes([sessao for sessao in _carregarSessoes() if not hmac.compare_digest(sessao["hash"], hash_token)])
+        banco_seguranca.removerSessao(_hashToken(token))
 
 
 def revogarSessoes(login):
     """Derruba todos os navegadores logados desse usuário (troca de senha, desativação, mudança de perfil)."""
-    _salvarSessoes([sessao for sessao in _carregarSessoes() if sessao["usuario"] != login])
+    banco_seguranca.removerSessoesUsuario(login)
 
 
 def _cookieDoNavegador():
@@ -313,10 +307,15 @@ def sair():
 
 def autenticar(login, senha, disp=None):
     """Valida usuário e senha. Retorna (usuário, '') se entrou, ou (None, mensagem)."""
+    with trava_usuarios:
+        return _autenticarSemTrava(login, senha, disp)
+
+
+def _autenticarSemTrava(login, senha, disp=None):
     login, senha = (login or "")[:100], (senha or "")[:256]  # limita o tamanho: evita gastar CPU com entradas gigantes
     usuarios = carregarUsuarios()
     usuario = buscar(usuarios, login)
-    generica = f"Usuário ou senha incorretos. Se errou várias vezes, aguarde cerca de {BLOQUEIO_MIN} min ou fale com um administrador."
+    generica = f"Usuário ou senha incorretos. Se errou várias vezes, aguarde alguns minutos ou fale com um administrador."
     ds_ip, nm_computador = (disp or {}).get("ip", ""), (disp or {}).get("host", "")
     if usuario is None:
         gerarHash(senha or "x")  # gasta o mesmo tempo, para não revelar quais usuários existem
@@ -330,9 +329,11 @@ def autenticar(login, senha, disp=None):
     if not senhaConfere(senha or "", usuario):
         usuario["falhas"] = usuario.get("falhas", 0) + 1
         if usuario["falhas"] >= MAX_FALHAS:
-            usuario["bloqueado_ate"] = (agora() + timedelta(minutes=BLOQUEIO_MIN)).isoformat()
+            usuario["bloqueios"] = usuario.get("bloqueios", 0) + 1  # cada bloqueio seguido dobra a espera (máx. 32x)
+            nr_minutos = BLOQUEIO_MIN * 2 ** min(usuario["bloqueios"] - 1, 5)
+            usuario["bloqueado_ate"] = (agora() + timedelta(minutes=nr_minutos)).isoformat()
             usuario["falhas"] = 0
-            registrarEvento("login_bloqueado", usuario["usuario"], f"{MAX_FALHAS} erros seguidos de senha", ds_ip, nm_computador)
+            registrarEvento("login_bloqueado", usuario["usuario"], f"{MAX_FALHAS} erros seguidos de senha ({nr_minutos} min)", ds_ip, nm_computador)
         else:
             registrarEvento("login_falha", usuario["usuario"], "senha incorreta", ds_ip, nm_computador)
         salvarUsuarios(usuarios)
@@ -349,6 +350,7 @@ def autenticar(login, senha, disp=None):
             registrarEvento("bloqueio_dispositivo", usuario["usuario"], ", ".join(usuario["bloqueio_dispositivo"]["com"]) + " no mesmo computador", ds_ip, nm_computador)
             return None, texto_mensagem
     usuario["falhas"], usuario["bloqueado_ate"], usuario["ultimo_acesso"] = 0, None, agora().isoformat(sep=" ")
+    usuario["bloqueios"] = 0
     if not usuario.get("pimenta"):
         usuario.update(gerarHash(senha))  # conta antiga: regrava o hash já protegido pelo segredo do .env
     salvarUsuarios(usuarios)
@@ -359,16 +361,14 @@ def autenticar(login, senha, disp=None):
 # ---------------------------------------------------------------- confirmação de presença (a cada SESSAO_MIN)
 def renovarSessao():
     """A pessoa confirmou que está ativa: estende a sessão e o token por mais SESSAO_MIN minutos."""
+    if not tokenAtivo(st.session_state.get("_token")):  # sessão derrubada (ex.: senha trocada em outro lugar): não renova
+        _encerrarSessao()
+        return
     registrarEvento("sessao_renovada", (st.session_state.get(CHAVE_SESSAO) or {}).get("usuario", ""))
     token = st.session_state.get("_token")
     novo_fim = agora() + timedelta(minutes=SESSAO_MIN)
     if token:
-        hash_token = _hashToken(token)
-        sessoes = _carregarSessoes()
-        for sessao in sessoes:
-            if hmac.compare_digest(sessao["hash"], hash_token):
-                sessao["expira_em"] = (novo_fim + timedelta(seconds=GRACA_SEG)).isoformat()
-        _salvarSessoes(sessoes)
+        banco_seguranca.renovarSessaoBanco(_hashToken(token), (novo_fim + timedelta(seconds=GRACA_SEG)).isoformat())
         st.session_state["_cookie_gravar"] = token  # renova também o prazo do cookie no navegador
     st.session_state[CHAVE_SESSAO]["ativo_ate"] = novo_fim.isoformat()
     st.session_state["_dlg_presenca"] = False
@@ -433,20 +433,6 @@ MSG_BLOQUEIO_DISPOSITIVO = ("Conta bloqueada: foram usadas duas contas diferente
                             "Apenas um administrador pode desbloquear.")
 
 
-def _carregarDispositivos():
-    try:
-        return json.loads(ARQ_DISPOSITIVOS.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
-
-
-def _salvarDispositivos(vinculos):
-    ARQ_DISPOSITIVOS.parent.mkdir(parents=True, exist_ok=True)
-    tmp = ARQ_DISPOSITIVOS.with_suffix(".tmp")
-    tmp.write_text(json.dumps(vinculos, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(ARQ_DISPOSITIVOS)
-
-
 def _nomeDoComputador(ip):
     """Nome do computador do IP (DNS reverso, ex.: TAG83), com limite de 2 s. Vazio se não resolver."""
     if not ip:
@@ -506,7 +492,7 @@ def identificarDispositivo():
 def _checarDispositivo(usuario, usuarios, disp):
     """Registra o uso do computador por `u` (não administrador). Se outra conta não administradora já usou o mesmo
     computador (mesmo navegador ou mesmo nome de computador), bloqueia as duas e devolve a mensagem."""
-    vinculos = _carregarDispositivos()
+    vinculos = banco_seguranca.listarDispositivos()
 
     def mesmo(vinculo):
         return vinculo["usuario"] != usuario["usuario"] and (vinculo.get("id") == disp["id"] or (disp["host"] and vinculo.get("host") == disp["host"]))
@@ -514,9 +500,7 @@ def _checarDispositivo(usuario, usuarios, disp):
     outros = sorted({vinculo["usuario"] for vinculo in vinculos if mesmo(vinculo)})
     outros = [login_outro for login_outro in outros if (conta_outra := buscar(usuarios, login_outro)) and conta_outra["perfil"] != "admin"]
     quando = agora().isoformat(sep=" ", timespec="seconds")
-    vinculos = [vinculo for vinculo in vinculos if not (vinculo["usuario"] == usuario["usuario"] and vinculo.get("id") == disp["id"])]
-    vinculos.append({"usuario": usuario["usuario"], "id": disp["id"], "ip": disp["ip"], "host": disp["host"], "visto_em": quando})
-    _salvarDispositivos(vinculos)
+    banco_seguranca.registrarDispositivo(usuario["usuario"], disp["id"], disp["ip"], disp["host"], quando)  # insere ou atualiza o vínculo
     st.session_state["_disp_gravar"] = disp["id"]
     if not outros:
         return None
@@ -534,7 +518,7 @@ def excluirUsuario(usuarios, login):
     usuarios[:] = [usuario for usuario in usuarios if usuario["usuario"] != login]
     salvarUsuarios(usuarios)
     revogarSessoes(login)
-    _salvarDispositivos([vinculo for vinculo in _carregarDispositivos() if vinculo["usuario"] != login])
+    banco_seguranca.removerDispositivosUsuario(login)
     for outra_conta in usuarios:  # quem foi bloqueado por dividir computador com a conta apagada fica livre
         bloqueio = outra_conta.get("bloqueio_dispositivo")
         if bloqueio and login in bloqueio.get("com", []):
@@ -548,7 +532,7 @@ def desbloquearDispositivo(alvo):
     """Admin libera a conta e apaga os vínculos dela, para recomeçar do zero."""
     alvo.pop("bloqueio_dispositivo", None)
     registrarEvento("desbloqueio", (st.session_state.get(CHAVE_SESSAO) or {}).get("usuario", ""), f"desbloqueou {alvo['usuario']}")
-    _salvarDispositivos([vinculo for vinculo in _carregarDispositivos() if vinculo["usuario"] != alvo["usuario"]])
+    banco_seguranca.removerDispositivosUsuario(alvo["usuario"])
 
 
 # ---------------------------------------------------------------- telas
@@ -602,40 +586,176 @@ html body .block-container { max-width: 1020px; padding-top: 9vh; }
 """
 
 
+@st.cache_data(show_spinner=False)
+def _logoPortalBase64():
+    """Logo do painel de acesso: TAG + "Portal de Automações" (app/assets/logo_portal_automacoes.png)."""
+    return base64.b64encode((diretorio_base / "app" / "assets" / "logo_portal_automacoes.png").read_bytes()).decode()
+
+
 def _moldura(subtitulo):
     """Painel dividido: marca à esquerda (já desenhada aqui); devolve a coluna da direita para o formulário."""
-    st.markdown(_CSS_SEM_MENU + _CSS_LOGIN, unsafe_allow_html=True)
-    b64 = _logoBase64()
-    logo = f'<img class="le-logo" src="data:image/png;base64,{b64}" alt="TAG Investimentos">' if b64 else ""
+    st.markdown(_CSS_SEM_MENU + _CSS_LOGIN + _CSS_TELA_CHEIA, unsafe_allow_html=True)
+    logo = f'<img class="le-logo" src="data:image/png;base64,{_logoPortalBase64()}" alt="TAG - Portal de Automações">'
     with st.container(key="login_wrap"):
         esquerda, direita = st.columns([1.05, 1], gap="small")
         with esquerda, st.container(key="login_esq"):
             st.markdown(
-                f'{logo}<p class="le-titulo">Portal TAG</p><p class="le-sub">{subtitulo}</p>'
-                f'<div class="le-linha"></div><p class="le-versao">{rotulo("portal")}</p>',
+                f'<div class="le-marca">{logo}</div><div class="le-linha"></div>'
+                '<p class="le-sistema">SISTEMA DE AUTENTICAÇÃO</p><p class="le-sub">Bem-vindo ao seu espaço de trabalho.</p>'
+                f'<p class="le-rodape">© {datetime.now().year} TAG · Todos os direitos reservados</p>',
                 unsafe_allow_html=True,
             )
     return direita
 
 
+def molduraPainel(subtitulo):
+    """Mesmo painel dividido da tela de login, para outras telas que vêm logo após o login. Devolve a coluna da direita."""
+    return _moldura(subtitulo)
+
+
 def telaLogin():
     centro = _moldura("Acesse com seu usuário e senha")
     with centro, st.container(key="login_card"):
-        st.markdown('<p class="secao">Entrar</p>', unsafe_allow_html=True)
+        st.markdown('<p class="lg-titulo">Bem-vindo</p><p class="lg-sub">Faça login para acessar o sistema</p>', unsafe_allow_html=True)
         with st.form("form_login"):
             login = st.text_input("Usuário", autocomplete="username")
             senha = st.text_input("Senha", type="password", autocomplete="current-password")
-            enviar = st.form_submit_button("Entrar", type="primary", use_container_width=True)
+            enviar = st.form_submit_button("Entrar  →", type="primary", use_container_width=True)
         if enviar:
             usuario, erro = autenticar(login, senha, identificarDispositivo())
             if usuario:
-                _abrirSessao(usuario)
-                if (espaco_reservado := st.session_state.pop("_ph_login", None)) is not None:
-                    espaco_reservado.empty()
-                st.rerun()
+                ds_cifrado = banco_seguranca.buscarSegredo2fa(usuario["usuario"])
+                if ds_cifrado or usuario["perfil"] == "admin":  # admin é obrigatório: sem segredo, cadastra agora
+                    st.session_state["_2fa"] = {"usuario": usuario, "cadastrar": not ds_cifrado, "segredo": autenticador.novoSegredo(),
+                                                "erros": 0, "expira": (agora() + timedelta(minutes=5)).isoformat()}
+                    if (espaco_reservado := st.session_state.pop("_ph_login", None)) is not None:
+                        espaco_reservado.empty()
+                    st.rerun()
+                _concluirLogin(usuario)
             st.error(erro)
         st.markdown('<p class="login-rodape">Esqueceu a senha? Fale com um administrador do portal.</p>',
                     unsafe_allow_html=True)
+
+
+def _concluirLogin(usuario):
+    _abrirSessao(usuario)
+    st.session_state.pop("_2fa", None)
+    if (espaco_reservado := st.session_state.pop("_ph_login", None)) is not None:
+        espaco_reservado.empty()
+    st.rerun()
+
+
+def _mostrarQr(ds_segredo, nm_usuario):
+    st.image(autenticador.qrPng(ds_segredo, nm_usuario), width=190)
+    st.caption("Não consegue escanear? Digite esta chave no app:")
+    st.code(ds_segredo, language=None)
+
+
+# Telas de acesso ocupam a janela toda: painel da marca inteiro à esquerda (conteúdo centralizado) e formulário inteiro à direita
+_CSS_TELA_CHEIA = f"""
+<style>
+html body [class*="st-key-login_wrap"] {{
+    position: fixed; inset: 0; z-index: 999; width: 100vw; height: 100vh; max-width: none; margin: 0;
+    border: none; border-radius: 0; box-shadow: none; overflow-y: auto;
+}}
+html body [class*="st-key-login_wrap"] > [data-testid="stHorizontalBlock"] {{ min-height: 100vh; }}
+html body [class*="st-key-login_esq"] {{ min-height: 100vh; padding: 3rem 8%; align-items: stretch; text-align: center; }}
+[class*="st-key-login_esq"] .le-logo, [class*="st-key-login_esq"] .le-linha {{ margin-left: auto; margin-right: auto; }}
+html body [class*="st-key-login_card"] {{ min-height: 100vh; padding: 2rem 0; width: 100%; max-width: 380px; margin: 0 auto; align-items: stretch; }}
+[class*="st-key-login_card"] [data-testid="stImage"] img {{ border-radius: 8px; }}
+[class*="st-key-login_card"] [data-testid="stImage"] {{ display: flex; justify-content: center; width: 100%; }}
+[class*="st-key-login_card"] [data-testid="stImage"] > div, [class*="st-key-login_card"] [data-testid="stImage"] img {{ margin: 0 auto; }}
+[class*="st-key-login_card"] [data-testid="stCaptionContainer"] {{ text-align: center; }}
+[class*="st-key-login_card"] [data-testid="stCode"] {{ text-align: center; }}
+/* Painel da marca: degradê vinho com pontinhos, marca centralizada e direitos reservados no rodapé */
+html body [class*="st-key-login_esq"] {{
+    position: relative; border-right: none;
+    background: radial-gradient(rgba(255, 255, 255, .07) 1px, transparent 1.5px) 0 0 / 28px 28px,
+                linear-gradient(160deg, #7A1030 0%, #5C0C24 45%, #3A0416 100%);
+}}
+.le-marca {{ display: inline-block; text-align: right; }}
+.le-marca .le-logo {{ width: 330px; max-width: 100%; margin: 0; }}
+.le-invest {{ color: #fff; font-size: .72rem; font-weight: 700; letter-spacing: .14em; margin: .1rem 0 0; }}
+.le-sistema {{ color: #D9B9C3; font-size: 1.02rem; font-weight: 700; letter-spacing: .12em; margin: 0 0 .55rem; }}
+.le-sub {{ color: #A98592; font-size: .9rem; margin: 0; }}
+.le-rodape {{ position: absolute; left: 0; right: 0; bottom: 1.5rem; text-align: center; color: rgba(255, 255, 255, .32); font-size: .72rem; margin: 0; }}
+.le-linha {{ width: 40px; height: 1px; background: rgba(255, 255, 255, .35); margin: 2rem auto 1.6rem; border-radius: 0; }}
+/* Lado direito: título, campos com rótulo em maiúsculas e asterisco, sem moldura em volta do formulário */
+[class*="st-key-login_card"] .lg-titulo {{ color: #111827; font-size: 1.9rem; font-weight: 700; letter-spacing: -.01em; line-height: 1.2; margin: 0 0 .5rem; }}
+[class*="st-key-login_card"] .lg-sub {{ color: #6B7280; font-size: .92rem; margin: 0 0 1.6rem; }}
+/* Painel esquerdo: o Streamlit deixa o texto à esquerda e o rodapé preso ao bloco errado; força centro e ancora no painel */
+html body [class*="st-key-login_esq"] [data-testid="stElementContainer"] {{ position: static; width: 100%; }}
+html body [class*="st-key-login_esq"] .stMarkdown, html body [class*="st-key-login_esq"] .stMarkdown * {{ text-align: center; }}
+html body [class*="st-key-login_esq"] .le-marca {{ display: table; margin: 0 auto; }}
+html body [class*="st-key-login_esq"] .le-marca * {{ text-align: right; }}
+[class*="st-key-login_card"] [data-testid="stForm"] {{ border: none; padding: 0; margin-top: 0; }}
+[class*="st-key-login_card"] [data-testid="stWidgetLabel"] p {{
+    text-transform: uppercase; font-size: .68rem; font-weight: 700; letter-spacing: .08em; color: #374151; margin-bottom: .2rem;
+}}
+[class*="st-key-login_card"] [data-testid="stWidgetLabel"] p::after {{ content: " *"; color: #DC2626; }}
+[class*="st-key-login_card"] [data-baseweb="input"] {{
+    background: #fff; border: 1px solid #D5DAE3; border-radius: 8px; overflow: hidden;
+}}
+[class*="st-key-login_card"] [data-baseweb="input"] input {{ border: none !important; background: transparent !important; height: 2.75rem; padding-left: .9rem; }}
+[class*="st-key-login_card"] [data-baseweb="input"] > div {{ background: transparent !important; }}
+[class*="st-key-login_card"] [data-testid="stFormSubmitButton"] button,
+[class*="st-key-voltar_2fa"] button {{ width: 100%; height: 2.7rem; min-height: 2.7rem; }}
+[class*="st-key-voltar_2fa"] button p {{ color: #fff !important; font-weight: 600; }}
+@media (max-width: 640px) {{
+    html body [class*="st-key-login_esq"] {{ min-height: auto; padding: 1.8rem 1.6rem 3.4rem; }}
+    html body [class*="st-key-login_card"] {{ min-height: auto; padding: 1.6rem 1.4rem; }}
+}}
+</style>
+"""
+
+
+def tela2fa():
+    """Código do autenticador, logo depois da senha. No primeiro acesso mostra o QR code para cadastrar o app."""
+    pendente = st.session_state["_2fa"]
+    usuario = pendente["usuario"]
+    centro = _moldura("Verificação em duas etapas")
+    with centro, st.container(key="login_card"):
+        st.markdown('<p class="lg-titulo">Código do autenticador</p>', unsafe_allow_html=True)
+        if pendente["cadastrar"]:
+            st.markdown('<p class="secao-sub">Escaneie o QR code com o Google ou Microsoft Authenticator e digite o código de 6 dígitos '
+                        'que aparecer no app.</p>', unsafe_allow_html=True)
+            _mostrarQr(pendente["segredo"], usuario["usuario"])
+        else:
+            st.markdown('<p class="secao-sub">Digite o código de 6 dígitos que aparece no seu app autenticador.</p>', unsafe_allow_html=True)
+        with st.form("form_2fa"):
+            ds_codigo = st.text_input("Código", max_chars=7, autocomplete="one-time-code")
+            enviar = st.form_submit_button("Confirmar", type="primary", use_container_width=True)
+        if st.button("Voltar", key="voltar_2fa", use_container_width=True):
+            st.session_state.pop("_2fa", None)
+            st.rerun()
+        if enviar:
+            _conferirCodigo2fa(pendente, usuario, ds_codigo)
+
+
+def _conferirCodigo2fa(pendente, usuario, ds_codigo):
+    segredo_servidor = segredo()
+    if pendente["cadastrar"]:
+        ds_segredo = pendente["segredo"]
+    else:
+        ds_segredo = autenticador.decifrar(banco_seguranca.buscarSegredo2fa(usuario["usuario"]) or "", segredo_servidor)
+    if ds_segredo and autenticador.codigoConfere(ds_segredo, ds_codigo):
+        if pendente["cadastrar"]:
+            banco_seguranca.gravarSegredo2fa(usuario["usuario"], autenticador.cifrar(ds_segredo, segredo_servidor))
+            registrarEvento("2fa_ativado", usuario["usuario"], "")
+        _concluirLogin(usuario)
+    pendente["erros"] += 1
+    registrarEvento("login_falha", usuario["usuario"], "código do autenticador incorreto")
+    if pendente["erros"] >= MAX_FALHAS:
+        with trava_usuarios:
+            usuarios = carregarUsuarios()
+            alvo = buscar(usuarios, usuario["usuario"])
+            if alvo:
+                alvo["bloqueado_ate"] = (agora() + timedelta(minutes=BLOQUEIO_MIN)).isoformat()
+                salvarUsuarios(usuarios)
+        st.session_state.pop("_2fa", None)
+        registrarEvento("login_bloqueado", usuario["usuario"], f"{MAX_FALHAS} erros seguidos no código do autenticador")
+        st.rerun()
+    st.error("Código incorreto ou expirado. Confira o horário do celular e tente de novo.")
 
 
 def telaPrimeiroAcesso():
@@ -716,13 +836,19 @@ def exigirLogin():
     # Posição fixa: o Streamlit troca elementos por ordem de criação. Se algo (ex.: o cookie) aparecer antes do login só em
     # algumas execuções, o login antigo não é substituído e fica duplicado na tela até a página carregar.
     espaco_reservado = st.empty()
+    try:
+        lista_usuarios = carregarUsuarios()  # lida uma só vez por execução (era 2 a 3 idas ao banco por clique)
+    except ErroArquivoUsuarios:
+        st.error("Não foi possível ler o cadastro de usuários no banco de dados. Por segurança o portal foi bloqueado. "
+                 "Avise a TI: confira se o servidor MySQL está no ar e se a conexão (BANCO_BKO_*) está correta.")
+        st.stop()
     usuario = usuarioAtual()
     if usuario is None:  # tenta restaurar pelo cookie (ex.: a página foi recarregada)
         achado = usuarioDoToken(_cookieDoNavegador())
         if achado:
             _abrirSessao(achado[0], token=_cookieDoNavegador(), desde=achado[1], ativo_ate=achado[2])
             usuario = usuarioAtual()
-    elif ((reg := buscar(carregarUsuarios(), usuario["usuario"])) is None or not reg.get("ativo", True)
+    elif (not tokenAtivo(st.session_state.get("_token")) or (reg := buscar(lista_usuarios, usuario["usuario"])) is None or not reg.get("ativo", True)
           or (reg["perfil"] != "admin" and reg.get("bloqueio_dispositivo"))):
         _encerrarSessao()  # o usuário foi desativado ou removido: derruba a sessão na hora
         usuario = None
@@ -734,8 +860,14 @@ def exigirLogin():
         # Tela dentro de um placeholder: ao entrar ele é esvaziado antes do rerun, para o login não ficar como "fantasma" na página seguinte.
         st.session_state["_ph_login"] = espaco_reservado
         with espaco_reservado.container():
-            if not carregarUsuarios():
+            pendente = st.session_state.get("_2fa")
+            if pendente and datetime.fromisoformat(pendente["expira"]) <= agora():
+                st.session_state.pop("_2fa", None)
+                pendente = None
+            if not lista_usuarios:
                 telaPrimeiroAcesso()
+            elif pendente:
+                tela2fa()
             else:
                 telaLogin()
         st.stop()
@@ -768,18 +900,22 @@ _ICONE_SAIR = (
 CSS_BLOCO_USUARIO = f"""
 <style>
 [data-testid="stSidebar"] [data-testid="stHorizontalBlock"]:has([class*="st-key-botao_sair"]) {{
-    margin: 1rem 0 .4rem; padding: 0 1.1rem 0 1.3rem; flex-wrap: nowrap;
+    margin: 1rem 0 .4rem; padding: 0; flex-wrap: nowrap; align-items: center;
 }}
+[data-testid="stSidebar"] [data-testid="stHorizontalBlock"]:has([class*="st-key-botao_sair"]) > [data-testid="stColumn"]:first-child {{ flex: 1 1 auto; min-width: 0; width: auto; }}
+[data-testid="stSidebar"] [data-testid="stHorizontalBlock"]:has([class*="st-key-botao_sair"]) > [data-testid="stColumn"]:last-child {{ flex: 0 0 38px; width: 38px; min-width: 38px; }}
 .bloco-usuario {{ display: flex; flex-direction: column; gap: .1rem; min-width: 0; }}
 .bu-nome {{ color: #fff; font-weight: 600; font-size: .92rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
 .bu-perfil {{ color: {COR['dourado']}; font-size: .7rem; font-weight: 700; letter-spacing: .1em; text-transform: uppercase; }}
 [class*="st-key-botao_sair"] button {{
-    width: 38px; min-width: 38px; height: 38px; min-height: 38px; padding: 0; border-radius: 10px;
+    width: 38px; min-width: 38px; height: 38px; min-height: 38px; padding: 0; margin: 0; border-radius: 10px; line-height: 0; box-sizing: border-box;
     background: rgba(255, 255, 255, .16) !important; border: 1px solid {COR['dourado']} !important;
     display: flex; align-items: center; justify-content: center; transition: background .15s ease, border-color .15s ease;
 }}
 [class*="st-key-botao_sair"] button:hover {{ background: rgba(255, 255, 255, .28) !important; }}
 [class*="st-key-botao_sair"] button p {{ font-size: 0; line-height: 0; margin: 0; }}
+/* o texto "Sair" fica só para leitores de tela: sem ocupar espaço no botão, o ícone fica no centro */
+[class*="st-key-botao_sair"] button > div {{ position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }}
 [class*="st-key-botao_sair"] button::after {{
     content: ""; flex: none; width: 19px; height: 19px; background-color: #fff;
     -webkit-mask: {_ICONE_SAIR} center / contain no-repeat; mask: {_ICONE_SAIR} center / contain no-repeat;
@@ -803,6 +939,7 @@ def paginaMinhaConta():
         f'<p>Último acesso anterior: {dados.get("ultimo_acesso") or "–"}</p></div>',
         unsafe_allow_html=True,
     )
+    _secaoAutenticador(usuario)
     st.markdown('<p class="secao">Alterar senha</p>', unsafe_allow_html=True)
     if usuario["perfil"] != "admin":
         st.info("A senha só pode ser alterada por um administrador. Se precisar trocar, peça a redefinição.")
@@ -810,6 +947,49 @@ def paginaMinhaConta():
     col, _ = st.columns([1.2, 1])
     with col:
         _formTrocarSenha("form_troca_senha")
+
+
+def _secaoAutenticador(usuario):
+    st.markdown('<p class="secao">Autenticador (verificação em duas etapas)</p>', unsafe_allow_html=True)
+    nm_usuario = usuario["usuario"]
+    ds_cifrado = banco_seguranca.buscarSegredo2fa(nm_usuario)
+    if ds_cifrado:
+        st.success("Ativo: o login pede o código do seu app autenticador.")
+        if usuario["perfil"] == "admin":
+            st.caption("Para administradores é obrigatório. Se trocar de celular, peça a outro administrador para redefinir.")
+            return
+        with st.form("form_desativar_2fa", clear_on_submit=True):
+            ds_codigo = st.text_input("Para desativar, digite o código atual", max_chars=7, autocomplete="one-time-code")
+            if st.form_submit_button("Desativar autenticador"):
+                ds_segredo = autenticador.decifrar(ds_cifrado, segredo())
+                if ds_segredo and autenticador.codigoConfere(ds_segredo, ds_codigo):
+                    banco_seguranca.removerSegredo2fa(nm_usuario)
+                    registrarEvento("2fa_desativado", nm_usuario, "pelo próprio usuário")
+                    st.session_state["aviso_conta"] = "Autenticador desativado."
+                    st.rerun()
+                st.error("Código incorreto.")
+        return
+    if "_2fa_conta" not in st.session_state:
+        st.caption("Opcional: com o autenticador, o login passa a pedir também um código de 6 dígitos do seu celular.")
+        if st.button("Ativar autenticador", key="ativar_2fa"):
+            st.session_state["_2fa_conta"] = autenticador.novoSegredo()
+            st.rerun()
+        return
+    ds_segredo = st.session_state["_2fa_conta"]
+    _mostrarQr(ds_segredo, nm_usuario)
+    with st.form("form_ativar_2fa"):
+        ds_codigo = st.text_input("Digite o código que aparece no app", max_chars=7, autocomplete="one-time-code")
+        if st.form_submit_button("Confirmar e ativar", type="primary"):
+            if autenticador.codigoConfere(ds_segredo, ds_codigo):
+                banco_seguranca.gravarSegredo2fa(nm_usuario, autenticador.cifrar(ds_segredo, segredo()))
+                registrarEvento("2fa_ativado", nm_usuario, "pelo próprio usuário")
+                st.session_state.pop("_2fa_conta", None)
+                st.session_state["aviso_conta"] = "Autenticador ativado."
+                st.rerun()
+            st.error("Código incorreto.")
+    if st.button("Cancelar", key="cancelar_2fa"):
+        st.session_state.pop("_2fa_conta", None)
+        st.rerun()
 
 
 def paginaUsuarios():
@@ -971,6 +1151,18 @@ def paginaUsuarios():
                 if gerar_r:
                     st.session_state["senha_gerada_novo"] = (alvo_login, senha_final)
                 st.rerun()
+
+        st.markdown("**Autenticador (2FA)**")
+        if banco_seguranca.buscarSegredo2fa(alvo_login):
+            st.caption("Ativo. Se a pessoa perdeu o celular, redefina: ela cadastra o app de novo no próximo login.")
+            if st.button("Redefinir autenticador", key=f"redef2fa_{alvo_login}"):
+                banco_seguranca.removerSegredo2fa(alvo_login)
+                registrarEvento("2fa_redefinido", (st.session_state.get(CHAVE_SESSAO) or {}).get("usuario", ""), alvo_login)
+                revogarSessoes(alvo_login)
+                st.session_state["aviso_usuarios"] = f"Autenticador de {alvo_login} redefinido."
+                st.rerun()
+        else:
+            st.caption("Não ativado." + (" Será exigido o cadastro no próximo login (administrador)." if alvo["perfil"] == "admin" else ""))
 
         st.markdown("**Excluir usuário**")
         if eh_eu or ultimo_admin:

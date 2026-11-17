@@ -1,22 +1,19 @@
-import json
 import unicodedata
 from datetime import date
 
-import pandas as pd
 import streamlit as st
 
-from app.ambiente.config_ambiente import diretorio_base, diretorio_dados, inicializarAmbiente
+from app.ambiente.config_ambiente import diretorio_base, inicializarAmbiente
+from app.database.db import consultarUm
 from app.seguranca import controle_acesso
 from app.seguranca.registro_acessos import registrarUsoPagina
+from app.utilitarias import email_gmail
 from app.utilitarias.tema import COR, aplicarTema, topo
 from app.utilitarias.versoes import rotulo
 
 inicializarAmbiente()
 
 LOGO = diretorio_base / "app" / "assets" / "logo_tag.png"
-PLANILHA_EXTRATOS = diretorio_dados / "extratos" / "Template_Fundos_Ativos.xlsx"
-ARQUIVO_SOLICITACOES = diretorio_dados / "solicitacoes" / "solicitacoes.json"
-ARQUIVO_ERROS = diretorio_dados / "boletador" / "controle_erros.json"
 
 st.set_page_config(
     page_title="Portal | TAG Investimentos",
@@ -28,18 +25,19 @@ st.set_page_config(
 
 def seloExtratos():
     try:
-        qt_linhas = len(pd.read_excel(PLANILHA_EXTRATOS, dtype=str).dropna(how="all"))
-    except (OSError, ValueError):
-        return '<span class="badge warn">PLANILHA NÃO ENCONTRADA</span>'
-    return f'<span class="badge ok">{qt_linhas} LINHAS NA PLANILHA</span>'
+        qt_linhas = consultarUm("SELECT COUNT(*) AS qt FROM tb_extratos_fundo_cotista")["qt"]
+    except Exception:  # noqa: BLE001  (o selo da home nunca derruba a página)
+        return '<span class="badge warn">BANCO INDISPONÍVEL</span>'
+    if not qt_linhas:
+        return '<span class="badge warn">CADASTRO NÃO ENCONTRADO</span>'
+    return f'<span class="badge ok">{qt_linhas} LINHAS NO CADASTRO</span>'
 
 
 def seloSolicitacoes():
     try:
-        regs = json.loads(ARQUIVO_SOLICITACOES.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        qt_pendentes = consultarUm("SELECT COUNT(*) AS qt FROM tb_solicitacao WHERE nm_status <> %s", ("Concluído",))["qt"]
+    except Exception:  # noqa: BLE001
         return '<span class="badge neutro">SEM DADOS</span>'
-    qt_pendentes = sum(1 for registro in regs if registro.get("status") != "Concluído")
     if qt_pendentes:
         return f'<span class="badge warn">{qt_pendentes} NÃO CONCLUÍDA(S)</span>'
     return '<span class="badge ok">SEM PENDÊNCIAS</span>'
@@ -47,15 +45,16 @@ def seloSolicitacoes():
 
 def seloBoletas():
     try:
-        cards = json.loads(ARQUIVO_ERROS.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
+        dic_contagem = consultarUm(
+            "SELECT COUNT(*) AS qt_abertos, COALESCE(SUM(nm_prioridade LIKE %s), 0) AS qt_criticos "
+            "FROM tb_boletador_card WHERE nm_coluna <> %s", ("Cr%", "Solucionados"))
+    except Exception:  # noqa: BLE001
         return '<span class="badge neutro">SEM DADOS</span>'
-    abertos = [card for card in cards if card.get("coluna") != "Solucionados"]
-    criticos = [card for card in abertos if str(card.get("prioridade", "")).startswith("Cr")]
-    if criticos:
-        return f'<span class="badge div">{len(criticos)} CRÍTICO(S) EM ABERTO</span>'
-    if abertos:
-        return f'<span class="badge warn">{len(abertos)} PROBLEMA(S) EM ABERTO</span>'
+    qt_abertos, qt_criticos = int(dic_contagem["qt_abertos"]), int(dic_contagem["qt_criticos"])
+    if qt_criticos:
+        return f'<span class="badge div">{qt_criticos} CRÍTICO(S) EM ABERTO</span>'
+    if qt_abertos:
+        return f'<span class="badge warn">{qt_abertos} PROBLEMA(S) EM ABERTO</span>'
     return '<span class="badge ok">SEM PENDÊNCIAS</span>'
 
 
@@ -64,10 +63,10 @@ pg_extratos = st.Page("app/paginas/extratos/pagina.py", title="Solicitação de 
 pg_boletador = st.Page("app/paginas/boletador/pagina.py", title="Mesa de Boletas", url_path="boletas")
 pg_solicitacoes = st.Page("app/paginas/solicitacoes/pagina.py", title="Registro de Solicitações", url_path="solicitacoes")
 pg_britech = st.Page("app/paginas/britech/pagina.py", title="Rentabilidade e Cotas", url_path="rentabilidade")
-pg_bradesco = st.Page("app/paginas/bradesco_miami/pagina.py", title="Transactions Offshore", url_path="bradesco-miami")
+pg_bradesco = st.Page("app/paginas/bradesco_miami/pagina.py", title="Offshore", url_path="transactions-offshore")
 pg_externos = st.Page("app/paginas/processos_externos/pagina.py", title="Registro Solicitações de Fechamento", url_path="processos-externos")
 pg_caixa = st.Page("app/paginas/conciliacao_caixa/pagina.py", title="Conciliação de Caixa", url_path="caixa")
-pg_crava = st.Page("app/paginas/crava_cotas/pagina.py", title="CRAVA COTAS", url_path="crava-cotas")
+pg_crava = st.Page("app/paginas/crava_cotas/pagina.py", title="Crava Cotas", url_path="crava-cotas")
 
 # Para incluir uma nova ferramenta: crie a st.Page acima e acrescente uma linha aqui e em st.navigation.
 FERRAMENTAS = [
@@ -104,7 +103,7 @@ FERRAMENTAS = [
         "selo": lambda: '<span class="badge neutro">EXCEL</span>',
     },
     {
-        "chave": "crava_cotas", "sigla": "CR", "titulo": "CRAVA COTAS", "pagina": pg_crava,
+        "chave": "crava_cotas", "sigla": "CR", "titulo": "Crava Cotas", "pagina": pg_crava,
         "descricao": "Busca de informações do backoffice (pré-processamento) via Playwright.",
         "selo": lambda: '<span class="badge neutro">BACKOFFICE</span>',
     },
@@ -270,6 +269,9 @@ def cssMenu():
 
 aplicarTema()  # uma vez, vale para todas as páginas
 usuario = controle_acesso.exigirLogin()  # sem sessão válida mostra o login e interrompe aqui
+email_gmail.tratarRetornoGoogle(usuario["usuario"])  # conclui a conexão quando o Google devolve a pessoa com ?code=
+if "teste" not in st.query_params:  # a tela de teste (/extratos?teste) usa dados fictícios e não precisa do Google
+    email_gmail.exigirConexaoGoogle(usuario["usuario"])  # sem conexão válida com o Google (24h), mostra a tela de conexão e para aqui
 _liberados = controle_acesso.appsPermitidos(usuario, [ferramenta["chave"] for ferramenta in FERRAMENTAS])
 FERRAMENTAS[:] = [ferramenta for ferramenta in FERRAMENTAS if ferramenta["chave"] in _liberados]  # cada pessoa só vê (e acessa) o que foi liberado
 st.markdown(cssMenu(), unsafe_allow_html=True)
@@ -285,6 +287,7 @@ grupos["Conta"] = paginas_conta
 pg = st.navigation(grupos)
 st.markdown(controle_acesso.CSS_BLOCO_USUARIO, unsafe_allow_html=True)
 controle_acesso.blocoUsuario(usuario)
+email_gmail.blocoGoogleSidebar(usuario["usuario"])
 st.sidebar.markdown(
     f'<div class="rodape-menu"><b>Portal TAG Investimentos</b><br><span>{rotulo("portal")}</span></div>',
     unsafe_allow_html=True,

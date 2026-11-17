@@ -1,7 +1,5 @@
 """Dados, regras e e-mail das solicitações, compartilhados por Registro de Solicitações e Registro Solicitações de Fechamento."""
-import json
 import os
-import shutil
 import unicodedata
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -9,15 +7,10 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-from app.ambiente.config_ambiente import obterDiretorioDados
-
-PASTA = obterDiretorioDados("solicitacoes")
-# Para migrar à pasta compartilhada depois, basta apontar PASTA_DADOS para ela (ex.: Path(r"G:\...")).
-PASTA_DADOS = PASTA
-ARQ_SOLICITACOES = PASTA_DADOS / "solicitacoes.json"
-ARQ_CLIENTES = PASTA_DADOS / "clientes.json"
-PASTA_BACKUP = PASTA_DADOS / "backups"
-PASTA_EVIDENCIAS = PASTA_DADOS / "evidencias"
+from app.database.solicitacoes import (  # noqa: F401  (reexportados para as páginas)
+    PASTA_EVIDENCIAS, criarSolicitacao, excluirSolicitacao, listarClientes, listarSolicitacoes, salvarSolicitacao, salvarSolicitacoes,
+)
+from app.utilitarias import email_gmail
 
 TIPOS = ["Ajuste Fechamento", "Dúvida", "Pendente Extrato"]
 STATUS = ["Em aberto", "Em Processamento", "Concluído"]
@@ -49,37 +42,14 @@ def canonSolicitante(nome):
 
 
 def carregar():
-    try:
-        regs = json.loads(ARQ_SOLICITACOES.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
+    regs = listarSolicitacoes()  # erro de banco sobe como exceção: nunca vira lista vazia
     for registro in regs:
         registro["solicitante"] = canonSolicitante(registro.get("solicitante", ""))
     return regs
 
 
-def backupDiario():
-    """Copia o solicitacoes.json para backups/ uma vez por dia (estado do início do dia)."""
-    if not ARQ_SOLICITACOES.exists():
-        return
-    PASTA_BACKUP.mkdir(exist_ok=True)
-    destino = PASTA_BACKUP / f"solicitacoes_{date.today().isoformat()}.json"
-    if not destino.exists():
-        shutil.copy2(ARQ_SOLICITACOES, destino)
-
-
-def salvar(registros):
-    backupDiario()
-    tmp = ARQ_SOLICITACOES.with_suffix(".tmp")
-    tmp.write_text(json.dumps(registros, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(ARQ_SOLICITACOES)  # troca atômica: nunca deixa o arquivo pela metade
-
-
 def carregarClientes():
-    try:
-        return json.loads(ARQ_CLIENTES.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
+    return listarClientes()
 
 
 def evento(reg, titulo, detalhe=""):
@@ -146,6 +116,15 @@ def textoPrevisao(prev, tipo, prioridade, a_partir_de):
             f"(≈ {d_med.strftime('%d/%m/%Y')}) e 80% em até **{p80} dia(s)** (≈ {d_p80.strftime('%d/%m/%Y')}).")
 
 
+def neutralizarFormulas(tabela):
+    """Para exportar em CSV/Excel: texto que começa com = + - @ viraria fórmula ao abrir; o apóstrofo o mantém como texto."""
+    tabela = tabela.copy()
+    ds_perigosos = ("=", "+", "-", "@", chr(9), chr(13))
+    for nm_coluna in tabela.select_dtypes(include="object").columns:
+        tabela[nm_coluna] = tabela[nm_coluna].map(lambda valor: chr(39) + valor if isinstance(valor, str) and valor[:1] in ds_perigosos else valor)
+    return tabela
+
+
 def dataBr(iso):
     return date.fromisoformat(iso).strftime("%d/%m/%Y") if iso else ""
 
@@ -181,26 +160,23 @@ def paraDf(registros):
     return df
 
 
-# ---------------------------------------------------------------- e-mail (Outlook)
-def abrirEmail(reg):
-    """Abre o rascunho no Outlook (não envia). Retorna (ok, mensagem)."""
+# ---------------------------------------------------------------- e-mail (Gmail)
+def criarRascunhoGmail(mensagem_email):
+    """Cria o rascunho no Gmail da pessoa conectada (não envia). Retorna (ok, texto com o link para abrir e enviar)."""
     try:
-        import pythoncom
-        import win32com.client  # só existe no Windows com Outlook
-        pythoncom.CoInitialize()  # o Streamlit roda a página numa thread sem COM inicializado
-        aplicativo_outlook = win32com.client.Dispatch("Outlook.Application")
-        mensagem_email = aplicativo_outlook.CreateItem(0)
+        ds_link = email_gmail.criarRascunho(email_gmail.servicoDaSessao(), mensagem_email)
+    except email_gmail.GmailNaoConectadoErro:
+        return False, "Conecte a sua conta Google (\"Conectar ao Google\" na lateral) para criar o rascunho."
     except Exception as erro:  # noqa: BLE001
-        return False, f"Não consegui acessar o Outlook: {erro}"
+        return False, f"Não consegui criar o rascunho no Gmail: {erro}"
+    return True, f"Rascunho criado no Gmail: [abrir e enviar]({ds_link})."
 
+
+def abrirEmail(reg):
+    """Cria o rascunho da nova solicitação no Gmail (não envia). Retorna (ok, mensagem)."""
     evidencia = reg.get("evidencia") or ""
-    mensagem_email.To = EMAIL_PARA
-    mensagem_email.CC = EMAIL_CC
     urgente = "URGENTE - " if reg.get("prioridade") == "Urgente" else ""
-    mensagem_email.Subject = f"{urgente}NOVA SOLICITAÇÃO : {nomeCurto(reg['cliente'])}"
-    if urgente:
-        mensagem_email.Importance = 2  # alta
-    mensagem_email.Body = (
+    ds_texto = (
         "Olá,\n\nUma nova demanda foi registrada:\n\n"
         f"CLIENTE: {reg['cliente']}\nSOLICITANTE: {reg.get('solicitante', '')}\n"
         f"TIPO: {reg.get('tipo', '')}\nCOMPETÊNCIA: {reg.get('competencia', '')}\nPRIORIDADE: {reg.get('prioridade', 'Normal')}\n"
@@ -208,7 +184,8 @@ def abrirEmail(reg):
         f"EVIDÊNCIA: {'Sim (conforme anexo)' if evidencia else 'Não possui evidência'}\n\n"
         f"Favor iniciar a análise.\n\nAtenciosamente,\n{reg.get('solicitante', '')}"
     )
-    if evidencia and Path(evidencia).exists():
-        mensagem_email.Attachments.Add(str(Path(evidencia).resolve()))
-    mensagem_email.Display()
-    return True, "Rascunho aberto no Outlook."
+    lista_anexos = [Path(evidencia).resolve()] if evidencia and Path(evidencia).exists() else []
+    # nova solicitação vai PARA o processamento (EMAIL_CC), com cópia para o comercial (EMAIL_PARA)
+    mensagem_email = email_gmail.montarMimeTexto(
+        EMAIL_CC, f"{urgente}NOVA SOLICITAÇÃO : {nomeCurto(reg['cliente'])}", ds_texto, EMAIL_PARA or "", lista_anexos, bool(urgente))
+    return criarRascunhoGmail(mensagem_email)

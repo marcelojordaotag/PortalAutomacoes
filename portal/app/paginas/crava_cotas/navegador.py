@@ -3,19 +3,23 @@
 Roda como processo separado (`python navegador.py`), como o importador do boletador. O login fica
 guardado no perfil do navegador entre execuções. Para cada dia (D-2 e depois D-3): abre o card
 "Importar Crava Cotas Fundos Completos", confere o Progresso, filtra "Posição indisponível", copia a tabela e
-fecha o modal. O resultado vai para dados/crava_cotas/tabela.json (a página do app lê esse arquivo).
+fecha o modal. O resultado vai para o banco (tb_crava_leitura*, módulo app.database.crava).
 Se tudo foi copiado e conferido, o navegador fecha sozinho; com avisos ou falhas, fica aberto até o usuário fechar.
 """
-import json
+import os
 import re
-from datetime import datetime
+import sys
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))  # para importar app.* quando rodado como script
+os.environ.setdefault("APP_ENV", "local")
+
+from app.database.crava import gravarLeitura, lerLeitura  # noqa: E402
 
 URL_PRE_PROCESSAMENTO = "https://backoffice.taginvest.com.br/pre-processamento"
 PERFIL_NAVEGADOR = Path.home() / ".crava_cotas_perfil"  # guarda o login entre execuções
 TEMPO_MAX_LOGIN = 300  # segundos esperando o usuário logar
 TEMPO_LOGIN_AUTOMATICO = 90  # no aviso agendado ninguém loga: se o login salvo expirou, desiste cedo
-ARQUIVO_TABELA = Path(__file__).resolve().parents[3] / "dados" / "crava_cotas" / "tabela.json"  # lido pela página
 JS_LER_TABELA = r"""() => {
     const texto = (el) => (el ? el.innerText.replace(/\s+/g, " ").trim() : "");
     return [...document.querySelectorAll("table.p-datatable-table")]
@@ -75,13 +79,8 @@ def diagnostico(pagina_atual, contexto):
 
 
 def gravarArquivo(dias, concluido):
-    """Grava o estado atual para a página do app: um resultado por dia e se a rodada terminou."""
-    ARQUIVO_TABELA.parent.mkdir(parents=True, exist_ok=True)
-    ARQUIVO_TABELA.write_text(
-        json.dumps({"lido_em": datetime.now().isoformat(sep=" ", timespec="seconds"), "concluido": concluido,
-                    "colunas": COLUNAS_TABELA, "dias": dias}, ensure_ascii=False),
-        encoding="utf-8",
-    )
+    """Grava o estado atual no banco: um resultado por dia e se a rodada terminou."""
+    gravarLeitura(dias, concluido)
 
 
 def resultadoDia(situacao, progresso=None, linhas=None, detalhe=""):
@@ -90,12 +89,9 @@ def resultadoDia(situacao, progresso=None, linhas=None, detalhe=""):
 
 
 def resultadoConferido(dias, rotulo):
-    """Relê o arquivo e confirma que o dia foi gravado como "ok" com todas as linhas copiadas."""
-    try:
-        gravado = json.loads(ARQUIVO_TABELA.read_text(encoding="utf-8"))["dias"][rotulo]
-    except Exception:
-        return False
-    return gravado["situacao"] == "ok" and len(gravado["linhas"]) == len(dias[rotulo]["linhas"]) > 0
+    """Relê o banco e confirma que o dia foi gravado como "ok" com todas as linhas copiadas."""
+    gravado = lerLeitura()["dias"].get(rotulo)
+    return gravado is not None and gravado["situacao"] == "ok" and len(gravado["linhas"]) == len(dias[rotulo]["linhas"]) > 0
 
 
 def lerExecucoes(pagina_atual, contexto, modal, PlaywrightTimeoutError):
@@ -157,10 +153,7 @@ def processarDia(pagina_atual, contexto, rotulo, PlaywrightTimeoutError):
 
 def carregarDiasGravados():
     """Resultados já gravados (o modo automático atualiza só o dia dele e preserva os outros)."""
-    try:
-        return json.loads(ARQUIVO_TABELA.read_text(encoding="utf-8")).get("dias", {})
-    except Exception:
-        return {}
+    return lerLeitura()["dias"]
 
 
 def abrirPreProcessamento(rotulos=DIAS, automatico=False):

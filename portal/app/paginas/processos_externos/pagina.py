@@ -7,7 +7,7 @@ import streamlit as st
 
 from app.utilitarias.tema import aplicarTema, topo
 from app.paginas.solicitacoes.comum import (
-    MESES, PASTA_EVIDENCIAS, PRIORIDADES, STATUS, TIPOS, abrirEmail, canonSolicitante, carregar, carregarClientes, dataBr, evento, salvar,
+    MESES, PASTA_EVIDENCIAS, PRIORIDADES, STATUS, TIPOS, abrirEmail, canonSolicitante, carregar, carregarClientes, criarSolicitacao, dataBr, evento, salvarSolicitacao,
 )
 from app.paginas.solicitacoes.slack_solicitacoes import avisarSlackUrgente, cobrarSlack
 
@@ -70,7 +70,7 @@ topo("Registro Solicitações de Fechamento", "Abra solicitações ao processame
 
 if "form_v" not in st.session_state:
     st.session_state.form_v = 0  # muda a chave dos campos para limpar o formulário após salvar
-regs = carregar()  # sempre do disco: os registros mudam enquanto a pessoa está na tela
+regs = carregar()  # sempre do banco: os registros mudam enquanto a pessoa está na tela
 
 aba_nova, aba_minhas = st.tabs(["Nova solicitação", "Minhas solicitações"])
 
@@ -130,32 +130,30 @@ with aba_nova:
         elif not confirmar_dup:
             st.error("Existe solicitação semelhante em aberto. Marque a confirmação para registrar mesmo assim.")
         else:
-            novo_id = max((solicitacao["id"] for solicitacao in regs), default=0) + 1
-            caminho = ""
+            reg = {
+                "cliente": cliente, "solicitante": canonSolicitante(solicitante), "data": data_sol.isoformat(),
+                "tipo": tipo, "prioridade": prioridade, "competencia": competencia, "sla_data": sla_data.isoformat() if sla_data else None, "descricao": descricao.strip(), "status": "Em Processamento", "data_conclusao": None,
+                "evidencia": "", "historico": [],
+                "registrado_por": (st.session_state.get("auth") or {}).get("usuario", ""),
+            }
+            evento(reg, "Solicitação registrada", f"{tipo} · {prioridade}" + (f" · SLA {sla_data.strftime('%d/%m/%Y')}" if sla_data else "") + f" · competência {competencia} · por {reg['solicitante']}")
+            novo_id = criarSolicitacao(reg)  # o id vem do banco (AUTO_INCREMENT)
             if anexo is not None:
                 PASTA_EVIDENCIAS.mkdir(exist_ok=True)
                 nome_seguro = re.sub(r"[^A-Za-z0-9._-]", "_", Path(anexo.name).name)[-80:]  # sem pastas nem caracteres especiais
                 destino = PASTA_EVIDENCIAS / f"{novo_id}_{nome_seguro}"
                 destino.write_bytes(anexo.getbuffer())
-                caminho = str(destino)
-            reg = {
-                "id": novo_id, "cliente": cliente, "solicitante": canonSolicitante(solicitante), "data": data_sol.isoformat(),
-                "tipo": tipo, "prioridade": prioridade, "competencia": competencia, "sla_data": sla_data.isoformat() if sla_data else None, "descricao": descricao.strip(), "status": "Em Processamento", "data_conclusao": None,
-                "evidencia": caminho, "historico": [],
-                "registrado_por": (st.session_state.get("auth") or {}).get("usuario", ""),
-            }
-            evento(reg, "Solicitação registrada", f"{tipo} · {prioridade}" + (f" · SLA {sla_data.strftime('%d/%m/%Y')}" if sla_data else "") + f" · competência {competencia} · por {reg['solicitante']}")
-            regs.append(reg)
-            salvar(regs)
+                reg["evidencia"] = str(destino)  # o banco guarda só o nome do arquivo
+                salvarSolicitacao(reg)
             texto_mensagem = f"Solicitação #{novo_id} registrada."
             if prioridade == "Urgente":
                 ok_slack, texto_slack = avisarSlackUrgente(reg)
                 evento(reg, "Aviso urgente no Slack" if ok_slack else "Falha ao avisar no Slack", "" if ok_slack else texto_slack)
-                salvar(regs)
+                salvarSolicitacao(reg)
                 texto_mensagem += " " + texto_slack
             ok, texto = abrirEmail(reg)
-            evento(reg, "Rascunho de e-mail aberto" if ok else "Falha ao abrir e-mail", "" if ok else texto)
-            salvar(regs)
+            evento(reg, "Rascunho de e-mail criado" if ok else "Falha ao criar e-mail", "" if ok else texto)
+            salvarSolicitacao(reg)
             texto_mensagem += " " + texto
             st.session_state.form_v += 1
             st.session_state.aviso = texto_mensagem
@@ -203,7 +201,7 @@ with aba_minhas:
                          help="Selecione na tabela uma solicitação não concluída para cobrar o processamento."):
                 ok_cobranca, texto_cobranca = cobrarSlack(escolhida)
                 evento(escolhida, "Cobrança enviada no Slack" if ok_cobranca else "Falha ao cobrar no Slack", "" if ok_cobranca else texto_cobranca)
-                salvar(regs)
+                salvarSolicitacao(escolhida)
                 (st.success if ok_cobranca else st.error)(texto_cobranca)
             elif escolhida is None:
                 st.caption("Selecione uma linha da tabela para cobrar a resposta no Slack.")

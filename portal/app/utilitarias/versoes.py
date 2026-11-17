@@ -4,15 +4,15 @@ Formato: MAIOR.MENOR.CORRECAO (ex.: 1.2.0) e a data da alteração (AAAA-MM-DD).
 """
 
 VERSOES = {
-    "portal":        {"versao": "2.2.6", "data": "2026-11-04"},  # home.py, tema.py, iniciar.py
-    "extratos":      {"versao": "1.0.2", "data": "2026-11-03"},
-    "boletas":       {"versao": "1.1.0", "data": "2026-11-05"},
-    "rentabilidade": {"versao": "1.0.0", "data": "2026-10-22"},
-    "caixa":         {"versao": "2.8.4", "data": "2026-11-03"},
-    "solicitacoes":  {"versao": "2.0.5", "data": "2026-11-03"},
-    "processos_externos": {"versao": "1.2.7", "data": "2026-11-03"},
-    "crava_cotas":   {"versao": "0.7.3", "data": "2026-11-03"},
-    "bradesco":      {"versao": "1.0.1", "data": "2026-10-27"},
+    "portal":        {"versao": "2.10.0", "data": "2026-11-17"},  # home.py, tema.py, iniciar.py
+    "extratos":      {"versao": "1.9.0", "data": "2026-11-13"},
+    "boletas":       {"versao": "1.1.1", "data": "2026-11-06"},
+    "rentabilidade": {"versao": "1.1.0", "data": "2026-11-06"},
+    "caixa":         {"versao": "3.0.0", "data": "2026-11-12"},
+    "solicitacoes":  {"versao": "2.2.1", "data": "2026-11-17"},
+    "processos_externos": {"versao": "1.3.2", "data": "2026-11-12"},
+    "crava_cotas":   {"versao": "0.9.0", "data": "2026-11-06"},
+    "bradesco":      {"versao": "1.2.1", "data": "2026-11-12"},
 }
 
 

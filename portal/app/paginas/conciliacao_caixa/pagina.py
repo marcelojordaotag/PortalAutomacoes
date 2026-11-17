@@ -9,14 +9,10 @@ vl_saldo_caixa_dif) e deixa preencher, por carteira:
 A coluna "Fora de ±1" marca as diferenças menores que -1 ou maiores que 1.
 O preenchimento é salvo sozinho (por nome de arquivo) e a planilha pode ser baixada com OBS e Status.
 """
-import contextlib
 import html
 import io
-import json
 import os
 import re
-import tempfile
-import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,17 +22,14 @@ import streamlit as st
 from openpyxl import load_workbook
 from openpyxl.styles import PatternFill
 
+from app.utilitarias import email_gmail
 from app.utilitarias.componentes import seletorIds
 from app.utilitarias.tema import topo
 
-from app.ambiente.config_ambiente import obterDiretorioDados
+from app.database.caixa import gravarCategorias, gravarEstado, gravarMonitor, lerEstado, listarCategorias, listarMonitor, removerMonitor
+from app.database.carteiras import listarIdsCarteiras
 from app.paginas.conciliacao_caixa import pdf_extratos
 
-PASTA = obterDiretorioDados("conciliacao_caixa")
-ARQ_CATEGORIAS = Path(__file__).resolve().parents[2] / "assets" / "categorias.json"
-ARQ_IDS = obterDiretorioDados("britech") / "ids_cliente.xlsx"
-ARQ_MONITOR = PASTA / "estado" / "aut2_monitor.json"
-PASTA_ESTADO = PASTA / "estado"
 ABA = "Caixa"
 COLUNAS = ["id_carteira", "nm_carteira", "vl_saldo_caixa_tag", "vl_saldo_caixa_adm", "vl_saldo_caixa_dif"]
 LIMITE = 1.0
@@ -45,31 +38,20 @@ CATEGORIAS_INICIAIS = ["IR JUROS", "APLICAÇÃO + RESGATE AQUA"]
 
 
 def carregarCategorias():
-    try:
-        lista_categorias = json.loads(ARQ_CATEGORIAS.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        lista_categorias = CATEGORIAS_INICIAIS
+    lista_categorias = listarCategorias() or CATEGORIAS_INICIAIS
     return list(dict.fromkeys(str(categoria).strip() for categoria in lista_categorias if str(categoria).strip()))
 
 
 def salvarCategorias(lista_categorias):
-    ARQ_CATEGORIAS.write_text(json.dumps(lista_categorias, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def arqEstado(nome):
-    return PASTA_ESTADO / (re.sub(r"[^\w.-]+", "_", nome) + ".json")
+    gravarCategorias(lista_categorias)
 
 
 def carregarEstado(nome):
-    try:
-        return json.loads(arqEstado(nome).read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
+    return lerEstado(nome)
 
 
 def salvarEstado(nome, estado):
-    PASTA_ESTADO.mkdir(exist_ok=True)
-    arqEstado(nome).write_text(json.dumps(estado, ensure_ascii=False, indent=1), encoding="utf-8")
+    gravarEstado(nome, estado)
 
 
 def lerCaixa(dados):
@@ -127,65 +109,24 @@ def baixarPlanilha(dados, tabela):
 topo("Conciliação de Caixa", "Diferenças de caixa entre a TAG e a administradora, com observação e status por carteira",
      app="caixa")
 
-@contextlib.contextmanager
-def outlook():
-    """Aplicação do Outlook desta máquina. pywin32 só é importado aqui para a página abrir sem ele."""
-    import pythoncom
-    import win32com.client as win32
-
-    pythoncom.CoInitialize()
-    try:
-        yield win32.Dispatch("outlook.application")
-    finally:
-        pythoncom.CoUninitialize()
-
-
-def abrirEmailPeloLink():
-    """Link do Slack (?abrir=<EntryID>): abre o e-mail correspondente no Outlook desta máquina."""
-    item_registro = st.query_params.get("abrir")
-    if not item_registro:
-        return
-    del st.query_params["abrir"]
-    if not re.fullmatch(r"[0-9A-Fa-f]{20,200}", item_registro):
-        st.error("Link de e-mail inválido.")
-        return
-    try:
-        with outlook() as app_outlook:
-            app_outlook.GetNamespace("MAPI").GetItemFromID(item_registro).Display()
-        st.success("E-mail aberto no Outlook.")
-    except Exception as excecao:  # e-mail movido/apagado, ou aberto em outra máquina/conta
-        st.error(f"Não foi possível abrir o e-mail no Outlook: {excecao}")
-
-
-abrirEmailPeloLink()
 aba_aut1, aba_aut3, aba_caixa = st.tabs(["Aut1", "Aut3", "Conciliação de Caixa"])
 
-def emailOutlook(nome_img, bytes_img, token):
-    """Abre um e-mail novo no Outlook com a imagem no corpo (e a assinatura padrão, se houver). Não envia."""
+def textoErroGmail(erro):
+    if isinstance(erro, email_gmail.GmailNaoConectadoErro):
+        return "A conexão com a conta Google expirou ou não existe. Conecte-se de novo (\"Conectar ao Google\" na lateral)."
+    return str(erro)
+
+
+def criarRascunhoImagem(nome_img, bytes_img, token):
+    """Cria no Gmail um e-mail novo com a imagem no corpo (e a assinatura do Gmail), sem destinatários. Não envia.
+    Devolve o link do rascunho. O código escondido no corpo permite achar este e-mail em Enviados e a conversa dele."""
     cid = "imagem_email@tag"
-    # O código escondido no corpo permite achar este e-mail em "Itens Enviados" e a conversa dele na Caixa de Entrada.
-    corpo = (f'<p><img src="cid:{cid}" style="max-width:700px"></p>'
-             f'<span style="display:none;mso-hide:all;font-size:1px;color:#ffffff">{token}</span>')
-    with tempfile.TemporaryDirectory() as tmp:
-        arquivo = Path(tmp) / (re.sub(r"[^\w.-]+", "_", nome_img) or "imagem.png")
-        arquivo.write_bytes(bytes_img)
-        with outlook() as app_outlook:
-            mensagem_email = app_outlook.CreateItem(0)
-            anexo = mensagem_email.Attachments.Add(str(arquivo))
-            anexo.PropertyAccessor.SetProperty("http://schemas.microsoft.com/mapi/proptag/0x3712001F", cid)
-            anexo.PropertyAccessor.SetProperty("http://schemas.microsoft.com/mapi/proptag/0x7FFE000B", True)
-            mensagem_email.Display()  # carrega a assinatura padrão, se houver
-            for _ in range(10):
-                try:
-                    if re.search(r"<body", mensagem_email.HTMLBody, flags=re.IGNORECASE):
-                        break
-                except Exception:
-                    pass
-                time.sleep(0.2)
-            atual = mensagem_email.HTMLBody
-            corresp_body = re.search(r"<body[^>]*>", atual, flags=re.IGNORECASE)
-            mensagem_email.HTMLBody = (atual[: corresp_body.end()] + corpo + atual[corresp_body.end():]) if corresp_body else corpo + atual
-            time.sleep(1)  # dá tempo de o Outlook ler o arquivo temporário antes de ele ser apagado
+    servico = email_gmail.servicoDaSessao()
+    ds_tipo = {"png": "png", "gif": "gif"}.get(Path(nome_img).suffix.lower().lstrip("."), "jpeg")
+    ds_html = (f'<p><img src="cid:{cid}" style="max-width:700px"></p>'
+               f'<span style="display:none;mso-hide:all;font-size:1px;color:#ffffff">{token}</span><br>{email_gmail.assinaturaHtml(servico)}')
+    mensagem_email = email_gmail.montarMime("", "", ds_html, lista_imagens_bytes=[(cid, bytes_img, ds_tipo)], ds_texto_puro=f"ref: {token}")
+    return email_gmail.criarRascunho(servico, mensagem_email)
 
 
 def lerEnv():
@@ -194,15 +135,11 @@ def lerEnv():
 
 
 def carregarMonitor():
-    try:
-        return json.loads(ARQ_MONITOR.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return []
+    return listarMonitor()
 
 
 def salvarMonitor(lista):
-    PASTA_ESTADO.mkdir(exist_ok=True)
-    ARQ_MONITOR.write_text(json.dumps(lista, ensure_ascii=False, indent=1), encoding="utf-8")
+    gravarMonitor(lista)
 
 
 def enviarSlack(texto):
@@ -233,28 +170,23 @@ def avisarSlack(reg):
     texto = reg.get("corpo") or ""
     nota = reg.get("nota_anexos") or ""
     texto = (texto + ("\n\n" if texto and nota else "") + nota).strip()
-    if reg.get("entry_id"):  # o link abre o e-mail no Outlook de quem clica, com o portal rodando na máquina dele
-        base = lerEnv().get("PORTAL_URL", f"http://localhost:{st.get_option('server.port')}").rstrip("/")
-        texto += f"\n\nAbrir o e-mail no Outlook: {base}/caixa?abrir={reg['entry_id']}"
+    if reg.get("entry_id"):  # id da resposta no Gmail: o link abre a conversa na conta de quem clica
+        texto += f"\n\nAbrir o e-mail no Gmail: https://mail.google.com/mail/u/0/#all/{reg['entry_id']}"
     return enviarSlack(texto or f"(resposta de {reg.get('respondido_por', '?')} sem texto)")
 
 
 def notaDeAnexos(mensagem):
     """Avisa que a resposta traz anexos ou imagens, que o Slack não recebe (o webhook só aceita texto).
     Imagem no corpo só conta se vier antes da mensagem citada e tiver 20 KB ou mais (logos de assinatura são menores)."""
-    html_corpo = str(mensagem.HTMLBody or "")
-    marcas = [html_corpo.find(marca_busca) for marca_busca in ('id="divRplyFwdMsg"', "<b>De:", "<b>From:", "Enviada em:", "Mensagem original")]
+    html_corpo = str(mensagem.corpo_html or "")
+    marcas = [html_corpo.find(marca_busca) for marca_busca in ('class="gmail_quote"', 'id="divRplyFwdMsg"', "<b>De:", "<b>From:", "Enviada em:", "Mensagem original")]
     limite = min([ordem_item for ordem_item in marcas if ordem_item >= 0], default=len(html_corpo))
     anexos, imagens = 0, 0
-    for anexo in mensagem.Attachments:
-        try:
-            cid = str(anexo.PropertyAccessor.GetProperty("http://schemas.microsoft.com/mapi/proptag/0x3712001F") or "")
-        except Exception:
-            cid = ""
-        if cid and f"cid:{cid}" in html_corpo:
-            if html_corpo.find(f"cid:{cid}") < limite and anexo.Size >= 20 * 1024:
+    for anexo in mensagem.anexos:
+        if anexo.embutido:
+            if f"cid:{anexo.cid}" in html_corpo and html_corpo.find(f"cid:{anexo.cid}") < limite and anexo.tamanho >= 20 * 1024:
                 imagens += 1
-        elif not cid:
+        else:
             anexos += 1
     partes = []
     if anexos:
@@ -267,7 +199,7 @@ def notaDeAnexos(mensagem):
 def textoDaResposta(corpo, limite=3000):
     """Só o que a pessoa escreveu: corta a mensagem citada (De:, From:, -----Original...) e a assinatura
     (despedidas como Atenciosamente/Att/Abs, '--' e 'Enviado do meu ...'). Tira também as marcas de imagem."""
-    corte = re.search(r"^\s*(De:|From:|-{3,}\s*(Mensagem original|Original Message)|_{5,}|Em .{5,80} escreveu:|On .{5,80} wrote:)",
+    corte = re.search(r"^\s*(De:|From:|-{3,}\s*(Mensagem original|Original Message)|_{5,}|Em .{5,160} escreveu:|On .{5,160} wrote:)",
                       corpo, flags=re.IGNORECASE | re.MULTILINE)
     texto = corpo[: corte.start()] if corte else corpo
     texto = re.sub(r"\[(cid:[^\]]*|image\d+\.\w+|Imagem[^\]]*)\]", "", texto, flags=re.IGNORECASE)
@@ -280,74 +212,50 @@ def textoDaResposta(corpo, limite=3000):
     return texto.strip()[:limite]
 
 
-def _itensDesde(pasta, campo, desde):
-    """Itens da pasta com data >= desde, do mais novo para o mais antigo."""
-    itens = pasta.Items
-    itens.Sort(f"[{campo}]", True)
-    for mensagem in itens:
-        try:
-            if getattr(mensagem, campo).replace(tzinfo=None) < desde:
-                break
-        except Exception:
-            continue
-        yield mensagem
-
-
 def conferirMonitor(lista):
-    """Procura no Outlook o e-mail enviado (pelo código escondido no corpo) e depois a resposta dele.
+    """Procura no Gmail o e-mail enviado (pelo código escondido no corpo) e depois a resposta dele, na mesma conversa.
     Quando a resposta chega, avisa no Slack uma única vez. Devolve True se algo mudou."""
     abertos = [registro for registro in lista if registro["status"] in ("aguardando envio", "aguardando resposta")
                or (registro["status"] == "respondido" and registro.get("slack") != "enviado")]
     if not abertos:
         return False
+    servico = email_gmail.servicoDaSessao()
     mudou = False
-    with outlook() as app_outlook:
-        ns = app_outlook.GetNamespace("MAPI")
-        for registro in abertos:
-            if registro["status"] == "aguardando envio":
-                desde = datetime.fromisoformat(registro["criado_em"]) - timedelta(minutes=1)
-                original = None
-                for mensagem in _itensDesde(ns.GetDefaultFolder(5), "SentOn", desde):  # 5 = Itens Enviados
-                    try:
-                        if registro["token"] in (mensagem.HTMLBody or ""):
-                            original = mensagem  # segue até o mais antigo: respostas citam o código, mas saem depois
-                    except Exception:
-                        continue
-                if original is not None:
-                    registro.update(status="aguardando resposta", topico=str(original.ConversationTopic),
-                             assunto=str(original.Subject), para=str(original.To),
-                             enviado_em=original.SentOn.replace(tzinfo=None).isoformat(timespec="seconds"))
-                    mudou = True
-            if registro["status"] == "aguardando resposta":
-                desde = datetime.fromisoformat(registro["enviado_em"])
-                for mensagem in _itensDesde(ns.GetDefaultFolder(6), "ReceivedTime", desde):  # 6 = Caixa de Entrada
-                    try:
-                        if mensagem.Class != 43:
-                            continue
-                        # Resposta = mesmo assunto-base (ConversationTopic, igual na cópia de "Enviados" e na da Caixa de
-                        # Entrada; o ConversationID muda entre as duas) e índice com mais de 44 caracteres: o e-mail
-                        # original, ou a cópia dele que chega a quem o enviou para si mesmo, tem só 44; cada resposta soma 10.
-                        topico = registro.get("topico", registro.get("assunto", ""))
-                        resposta = (str(mensagem.ConversationTopic) == topico and len(str(mensagem.ConversationIndex)) > 44
-                                    and mensagem.ReceivedTime.replace(tzinfo=None) > desde)
-                        if resposta:
-                            registro.update(status="respondido", respondido_por=str(mensagem.SenderName), slack="pendente", entry_id=str(mensagem.EntryID),
-                                     corpo=textoDaResposta(str(mensagem.Body or "")), nota_anexos=notaDeAnexos(mensagem),
-                                     respondido_em=mensagem.ReceivedTime.replace(tzinfo=None).strftime("%d/%m/%Y %H:%M"))
-                            mudou = True
-                            break
-                    except Exception:
-                        continue
-            if registro["status"] == "aguardando resposta" and registro.get("prazo_horas") and registro.get("alerta_prazo") != "enviado":
-                horas = (datetime.now() - datetime.fromisoformat(registro["enviado_em"])).total_seconds() / 3600
-                if horas >= registro["prazo_horas"]:
-                    registro["alerta_prazo"] = enviarSlack(f"Sem resposta há {registro['prazo_horas']}h: \"{registro.get('assunto', '')}\" "
-                                                     f"(enviado para {registro.get('para', '')}).")
-                    mudou = True
-            if registro["status"] == "respondido" and registro.get("slack") != "enviado":
-                salvarMonitor(lista)  # grava antes de avisar: se cair no meio, não perde a resposta
-                registro["slack"] = avisarSlack(registro)
+    lista_enviados = None  # busca em Enviados uma vez só por conferência (do registro mais antigo em diante)
+    for registro in abertos:
+        if registro["status"] == "aguardando envio":
+            if lista_enviados is None:
+                dt_inicio = min(datetime.fromisoformat(item["criado_em"]) for item in abertos if item["status"] == "aguardando envio") - timedelta(minutes=1)
+                lista_enviados = email_gmail.buscarMensagens(servico, f"in:sent after:{email_gmail.segundosEpoch(dt_inicio)}")
+            original = None
+            for mensagem in lista_enviados:  # da mais nova para a mais antiga
+                if registro["token"] in (mensagem.corpo_html or "") + (mensagem.corpo or ""):
+                    original = mensagem  # segue até a mais antiga: respostas citam o código, mas saem depois
+            if original is not None:
+                registro.update(status="aguardando resposta", topico=original.id_conversa, assunto=original.assunto,
+                                para=", ".join(sorted(original.para)), enviado_em=original.quando.isoformat(timespec="seconds"))
                 mudou = True
+        if registro["status"] == "aguardando resposta":
+            desde = datetime.fromisoformat(registro["enviado_em"])
+            # Resposta = mensagem da mesma conversa, que não está em Enviados (não é do próprio remetente) e chegou depois do envio
+            respostas = [mensagem for mensagem in email_gmail.mensagensDaConversa(servico, registro.get("topico", ""))
+                         if "SENT" not in mensagem.rotulos and mensagem.quando > desde] if registro.get("topico") else []
+            if respostas:
+                resposta = respostas[-1]  # a mais nova
+                registro.update(status="respondido", respondido_por=resposta.nome_remetente or resposta.remetente, slack="pendente",
+                                entry_id=resposta.id, corpo=textoDaResposta(resposta.corpo or ""), nota_anexos=notaDeAnexos(resposta),
+                                respondido_em=resposta.quando.strftime("%d/%m/%Y %H:%M"))
+                mudou = True
+        if registro["status"] == "aguardando resposta" and registro.get("prazo_horas") and registro.get("alerta_prazo") != "enviado":
+            horas = (datetime.now() - datetime.fromisoformat(registro["enviado_em"])).total_seconds() / 3600
+            if horas >= registro["prazo_horas"]:
+                registro["alerta_prazo"] = enviarSlack(f"Sem resposta há {registro['prazo_horas']}h: \"{registro.get('assunto', '')}\" "
+                                                 f"(enviado para {registro.get('para', '')}).")
+                mudou = True
+        if registro["status"] == "respondido" and registro.get("slack") != "enviado":
+            salvarMonitor(lista)  # grava antes de avisar: se cair no meio, não perde a resposta
+            registro["slack"] = avisarSlack(registro)
+            mudou = True
     if mudou:
         salvarMonitor(lista)
     return mudou
@@ -408,19 +316,15 @@ def excelDasTabelas(tabelas, uma_aba):
 
 
 def idsBritech():
-    """IDs de carteira da planilha ids_cliente.xlsx do app de Rentabilidade (a mesma lista de lá)."""
-    try:
-        df = pd.read_excel(ARQ_IDS, dtype=str)
-        return [ordem_item.strip() for ordem_item in df.iloc[:, 0].dropna() if ordem_item.strip()]
-    except (OSError, ValueError, IndexError):
-        return []
+    """IDs de carteira do app de Rentabilidade (a mesma lista de lá)."""
+    return listarIdsCarteiras()
 
 
 with aba_aut3:
     st.markdown('<p class="secao">Consulta na Britech</p>'
                 '<p class="secao-sub">Selecione os IDs das carteiras que serão consultados</p>', unsafe_allow_html=True)
     ids_sel = seletorIds("IDs das carteiras", idsBritech(), "aut2_ids",
-                         "Os IDs da planilha ids_cliente.xlsx aparecem na lista. Também dá para digitar um ID novo.")
+                         "Os IDs das carteiras cadastradas aparecem na lista. Também dá para digitar um ID novo.")
     st.button("Consultar na Britech", key="aut2_consultar", disabled=True,
               help="Ainda sem conexão: a rota da Britech será definida depois.")
     st.caption("Consulta ainda não conectada. Os IDs escolhidos já ficam prontos para quando a rota for definida.")
@@ -435,18 +339,18 @@ with aba_aut3:
     prazo = st.selectbox("Avisar no Slack se ninguém responder em", [0, 1, 2, 4, 8, 24], key="aut2_prazo",
                          format_func=lambda horas: "Não avisar" if horas == 0 else f"{horas} hora(s)")
     if st.button("Enviar e-mail com a imagem", key="aut2_email", disabled=imagem is None,
-                 help="Abre o e-mail no Outlook com a imagem no corpo; você escolhe os destinatários e envia."):
+                 help="Cria o rascunho no Gmail com a imagem no corpo; você abre, escolhe os destinatários e envia."):
         token = f"AUT2-{uuid.uuid4().hex[:12]}"
         try:
-            emailOutlook(imagem.name, imagem.getvalue(), token)
-        except Exception as excecao:  # Outlook fechado/indisponível
-            st.error(f"Não foi possível usar o Outlook. Abra o Outlook e tente de novo. Detalhe: {excecao}")
+            ds_link = criarRascunhoImagem(imagem.name, imagem.getvalue(), token)
+        except Exception as excecao:  # sem conexão Google ou falha na API
+            st.error(f"Não foi possível criar o rascunho no Gmail. {textoErroGmail(excecao)}")
         else:
             lista = carregarMonitor()
             lista.insert(0, {"token": token, "imagem": imagem.name, "status": "aguardando envio", "prazo_horas": prazo,
                              "criado_em": datetime.now().isoformat(timespec="seconds")})
             salvarMonitor(lista)
-            st.success("E-mail aberto no Outlook. Envie por lá: o app passa a monitorar a resposta.")
+            st.success(f"Rascunho criado no Gmail: [abrir, escolher os destinatários e enviar]({ds_link}). O app passa a monitorar a resposta.")
     if imagem is None:
         st.caption("Suba a imagem para liberar o botão.")
 
@@ -464,17 +368,17 @@ with aba_aut3:
                 conferirMonitor(lista)
                 st.session_state["aut2_ultima_conf"] = agora
                 st.session_state.pop("aut2_erro_outlook", None)
-            except Exception as excecao:  # Outlook fechado
-                st.session_state["aut2_erro_outlook"] = str(excecao)
+            except Exception as excecao:  # sem conexão Google ou falha na API
+                st.session_state["aut2_erro_outlook"] = textoErroGmail(excecao)
         if st.session_state.get("aut2_erro_outlook"):
-            st.warning(f"Não foi possível consultar o Outlook agora: {st.session_state['aut2_erro_outlook']}")
+            st.warning(f"Não foi possível consultar o Gmail agora: {st.session_state['aut2_erro_outlook']}")
         if not lista:
             st.caption("Nenhum e-mail em monitoramento.")
             return
         ultima = st.session_state.get("aut2_ultima_conf")
         if ultima:
             st.caption(f"Última conferência às {ultima:%H:%M:%S}. O app confere sozinho a cada 1 min enquanto estiver aberto "
-                       "e o Outlook também.")
+                       "e a conexão Google também.")
         def selo(classe, texto):
             return f'<span class="badge {classe}">{html.escape(texto)}</span>' if texto else ""
 
@@ -512,7 +416,7 @@ with aba_aut3:
                 salvarMonitor(lista)
                 st.rerun(scope="fragment")
         if st.button("Limpar respondidos", key="aut2_limpar", disabled=not any(registro["status"] == "respondido" for registro in lista)):
-            salvarMonitor([registro for registro in lista if registro["status"] != "respondido"])
+            removerMonitor([registro["token"] for registro in lista if registro["status"] == "respondido"])
             st.rerun(scope="fragment")
 
     st.fragment(run_every=timedelta(minutes=1))(_painel)()

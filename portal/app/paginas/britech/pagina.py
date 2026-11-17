@@ -29,6 +29,8 @@ import streamlit as st
 
 from app.ambiente.config_ambiente import obterDiretorioDados
 from app.api import api_britech as tb  # busca na API Britech
+from app.database.carteiras import listarIdsCarteiras
+from app.database.historico_cotas import dataAtualizacaoHistorico, existeHistorico, lerHistorico, versaoHistorico
 from app.paginas.britech import converter as cv
 from app.paginas.britech import monitor as mon  # monitor de cotas: Acima/Abaixo/Dentro da banda
 from app.utilitarias.componentes import seletorIds
@@ -38,7 +40,7 @@ from app.paginas.britech.tema_britech import (COR, aplicarTema, avisoHtml, badge
 
 PASTA = obterDiretorioDados("britech")
 ARQUIVO_PADRAO = PASTA / cv.ARQUIVO_PADRAO
-CHAVE_ARQUIVO, CHAVE_EXTRATOS, CHAVE_HISTORICO = "arquivo_api", "pasta_extratos", "arquivo_historico"
+CHAVE_ARQUIVO, CHAVE_EXTRATOS = "arquivo_api", "pasta_extratos"
 
 # set_page_config fica no portal (home.py)
 aplicarTema()
@@ -347,16 +349,14 @@ def fonteDados():
         c1, c2 = st.columns(2)
         c1.text_input("Arquivo da API", value=str(ARQUIVO_PADRAO), key=CHAVE_ARQUIVO, help="Gerado pela busca na API")
         c2.text_input("Pasta dos extratos", value=str(cv.EXTRATOS_PADRAO), key=CHAVE_EXTRATOS)
-        st.text_input("Histórico de cotas (Monitor de cotas)", value=str(tb.ARQUIVO_HISTORICO), key=CHAVE_HISTORICO,
-                      help="CSV gerado pela busca na API, com Data, IdCarteira e CotaBruta. Também aceita a base original "
-                           "(DATA_COTA, ID_CARTEIRA, COTA_BRUTA) em CSV.")
+        st.caption("O histórico de cotas do Monitor de cotas fica no banco de dados (atualizado pela busca na API).")
 
 
 # ----------------------------------------------------------------------------
 # Busca na API: o usuário escolhe os IDs e o período (o mesmo que o teste.py faz)
 # ----------------------------------------------------------------------------
-def usarIdsDaPlanilha():
-    st.session_state["ids_busca"] = tb.lerIds()
+def usarIdsCadastrados():
+    st.session_state["ids_busca"] = listarIdsCarteiras()
 
 
 def limparIds():
@@ -380,8 +380,8 @@ def resumoBusca(resultado_calculo):
                         "Atenção:"))
 
 
-def secaoBusca(analises, caminho, pasta_extratos, arquivo_historico, tem_dados):
-    ids_planilha = tb.lerIds()
+def secaoBusca(analises, caminho, pasta_extratos, tem_dados):
+    ids_planilha = listarIdsCarteiras()
     na_tela = list(analises)
     if analises:
         atributos = next(iter(analises.values()))["ativos"].attrs
@@ -398,7 +398,7 @@ def secaoBusca(analises, caminho, pasta_extratos, arquivo_historico, tem_dados):
         c_ids, c_per = st.columns([3, 1.6])
         with c_ids:
             seletorIds("IDs das carteiras", opcoes, "ids_busca",
-                       "Os IDs da planilha ids_cliente.xlsx aparecem na lista. Também dá para digitar um ID novo.")
+                       "Os IDs das carteiras cadastradas aparecem na lista. Também dá para digitar um ID novo.")
         periodo = c_per.date_input("Período (dia-base e último dia)", value=(ini_padrao, fim_padrao), format="DD/MM/YYYY",
                                    key="periodo_busca")
         com_historico = False  # o histórico do Monitor de cotas é buscado só na aba do monitor
@@ -406,9 +406,9 @@ def secaoBusca(analises, caminho, pasta_extratos, arquivo_historico, tem_dados):
         b1, b2, b3, _ = st.columns([1.5, 1.8, 1, 2.2])
         buscar = b1.button("Buscar na API", icon=":material/search:", key="btn_buscar", use_container_width=True,
                            disabled=not st.session_state.get("ids_busca"))
-        b2.button("Usar IDs da planilha", icon=":material/table_view:", key="btn_planilha", use_container_width=True,
-                  on_click=usarIdsDaPlanilha, disabled=not ids_planilha,
-                  help=f"Carrega os {len(ids_planilha)} ID(s) de {tb.ARQUIVO_IDS.name}")
+        b2.button("Usar IDs cadastrados", icon=":material/table_view:", key="btn_planilha", use_container_width=True,
+                  on_click=usarIdsCadastrados, disabled=not ids_planilha,
+                  help=f"Carrega os {len(ids_planilha)} ID(s) das carteiras cadastradas")
         b3.button("Limpar", icon=":material/close:", key="btn_limpar", use_container_width=True, on_click=limparIds)
 
         if not buscar:
@@ -433,7 +433,7 @@ def secaoBusca(analises, caminho, pasta_extratos, arquivo_historico, tem_dados):
             try:
                 resultado = tb.buscarDados(ids, periodo[0].isoformat(), periodo[1].isoformat(), arquivo_saida=caminho,
                                             pasta_extratos=pasta_extratos, progresso=mostrar,
-                                            historico_inicio=None, arquivo_historico=arquivo_historico)
+                                            historico_inicio=None)
             except (ValueError, RuntimeError, PermissionError) as excecao:
                 erro = str(excecao)
             except Exception as excecao:  # rede, credencial etc.: mostra em vez de quebrar a página
@@ -619,9 +619,9 @@ def versaoMonitor():
 
 
 @st.cache_data(show_spinner="Calculando o monitor…")
-def carregarMonitor(caminho, mtime, n_desvios, piso_bps, codigo):
-    extensao = Path(caminho).suffix.lower()
-    base = pd.read_excel(caminho) if extensao in (".xlsx", ".xls") else pd.read_csv(caminho)
+def carregarMonitor(versao_historico, n_desvios, piso_bps, codigo):
+    """versao_historico entra na chave do cache: busca nova na API recarrega o histórico do banco."""
+    base = lerHistorico()
     return mon.analisarMonitor(base, {"n_desvios": n_desvios, "piso_bps": piso_bps})
 
 
@@ -750,14 +750,14 @@ def detalheMonitor(id_, resultado_calculo, janela_inicial, nome, status_conferen
             html(avisoHtml(NIVEL_ALERTA[nivel], texto))
 
 
-def buscaMonitor(analises, caminho_historico):
+def buscaMonitor(analises):
     """Busca do histórico de cotas: só roda quando o usuário clica (não acompanha a busca da conferência)."""
-    ids_padrao = list(analises) or tb.lerIds()
+    ids_padrao = list(analises) or listarIdsCarteiras()
     if analises:
         fim_padrao = next(iter(analises.values()))["ativos"].attrs["fim"].date()
     else:
         fim_padrao = date.fromisoformat(tb.DATA_FIM_PADRAO)
-    with st.expander("Buscar histórico de cotas na API", expanded=not caminho_historico.exists(), icon=":material/cloud_download:"):
+    with st.expander("Buscar histórico de cotas na API", expanded=not existeHistorico(), icon=":material/cloud_download:"):
         html('<div class="secao-sub">O monitor precisa de muito mais histórico que a conferência. Escolha as carteiras e '
              'clique em <b>Buscar cotas</b>. Leva cerca de 1 segundo por carteira.</div>')
         st.session_state.setdefault("ids_monitor", ids_padrao)
@@ -788,8 +788,7 @@ def buscaMonitor(analises, caminho_historico):
                 andamento.write(texto)
 
             try:
-                resultado_calculo = tb.buscarHistoricoCotas(ids, desde.isoformat(), ate.isoformat(), arquivo_saida=caminho_historico,
-                                                progresso=mostrar)
+                resultado_calculo = tb.buscarHistoricoCotas(ids, desde.isoformat(), ate.isoformat(), progresso=mostrar)
             except (ValueError, RuntimeError, PermissionError) as excecao:
                 erro = str(excecao)
             except Exception as excecao:
@@ -803,9 +802,10 @@ def buscaMonitor(analises, caminho_historico):
             st.rerun()
 
 
-def abaMonitor(analises, pasta_extratos, caminho_historico):
-    buscaMonitor(analises, caminho_historico)
-    if not caminho_historico.exists():
+def abaMonitor(analises, pasta_extratos):
+    buscaMonitor(analises)
+    versao_historico = versaoHistorico()
+    if versao_historico is None:
         html(avisoHtml("alerta", "Ainda não há histórico de cotas. Clique em 'Buscar cotas' acima.", "Monitor sem dados:"))
         return
 
@@ -830,7 +830,7 @@ def abaMonitor(analises, pasta_extratos, caminho_historico):
             "Fora da banda não é erro: é um dia incomum para aquela carteira.", unsafe_allow_html=True)
 
     try:
-        resultado_calculo = carregarMonitor(str(caminho_historico), caminho_historico.stat().st_mtime, float(n_desvios), float(piso_bps),
+        resultado_calculo = carregarMonitor(versao_historico, float(n_desvios), float(piso_bps),
                                versaoMonitor())
     except ValueError as excecao:
         html(avisoHtml("div", str(excecao), "Não foi possível ler o histórico de cotas."))
@@ -859,8 +859,8 @@ def abaMonitor(analises, pasta_extratos, caminho_historico):
     if desatualizadas:
         html(avisoHtml("alerta", f"cota mais antiga que a data de referência ({resultado_calculo['data_ref']:%d/%m/%Y}) em: "
                                   f"{', '.join(desatualizadas)}.", "Cota desatualizada:"))
-    html(f'<div class="fonte-dados">Histórico de {datetime.fromtimestamp(caminho_historico.stat().st_mtime):%d/%m/%Y %H:%M} · '
-         f'{esc(caminho_historico.name)} · banda de {resultado_calculo["params"]["n_desvios"]:g} desvio(s) · piso de {resultado_calculo["params"]["piso_bps"]:g} bps</div>')
+    html(f'<div class="fonte-dados">Histórico de {dataAtualizacaoHistorico():%d/%m/%Y %H:%M} · '
+         f'banco de dados · banda de {resultado_calculo["params"]["n_desvios"]:g} desvio(s) · piso de {resultado_calculo["params"]["piso_bps"]:g} bps</div>')
 
     # Filtros
     f1, f2 = st.columns([3, 2], vertical_alignment="center")
@@ -926,7 +926,7 @@ def abaMonitor(analises, pasta_extratos, caminho_historico):
     st.write("")
     x1, x2, x3 = st.columns([1.6, 1.6, 3], vertical_alignment="center")
     com_graficos = x3.checkbox("Incluir gráficos no Excel", value=len(ids) <= 40, key="mon_xl_graficos",help="Um gráfico por carteira e janela (até 160 no total).")
-    assinatura = (str(caminho_historico), caminho_historico.stat().st_mtime, float(n_desvios), float(piso_bps), com_graficos)
+    assinatura = (str(versao_historico), float(n_desvios), float(piso_bps), com_graficos)
     if x1.button("Gerar Excel do monitor", icon=":material/table_chart:", use_container_width=True, key="mon_xl_gerar"):
         with st.spinner("Gerando o Excel…"):
             dados, info_xl = mon.excelMonitorBytes(resultado_calculo, nomes, com_graficos)
@@ -947,7 +947,6 @@ icon=":material/download:", key="mon_xl_baixar",mime="application/vnd.openxmlfor
 arquivo = st.session_state.get(CHAVE_ARQUIVO, str(ARQUIVO_PADRAO))
 pasta_extratos = st.session_state.get(CHAVE_EXTRATOS, str(cv.EXTRATOS_PADRAO))
 caminho = Path(arquivo)
-caminho_historico = Path(st.session_state.get(CHAVE_HISTORICO, str(tb.ARQUIVO_HISTORICO)))
 
 ANALISES, ERROS, erro_leitura = {}, {}, None
 if caminho.exists():
@@ -967,13 +966,13 @@ else:
 ultima_busca = st.session_state.pop("resultado_busca", None)
 if ultima_busca:
     resumoBusca(ultima_busca)
-secaoBusca(ANALISES, caminho, pasta_extratos, caminho_historico, tem_dados=bool(ANALISES) or caminho_historico.exists())
+secaoBusca(ANALISES, caminho, pasta_extratos, tem_dados=bool(ANALISES) or existeHistorico())
 
 tab_conferencia, tab_monitor = st.tabs(["Conferência de Rentabilidade", "Monitor de Cotas"])
 with tab_conferencia:
     abaConferencia(ANALISES, ERROS, caminho, pasta_extratos, erro_leitura)
 with tab_monitor:
-    abaMonitor(ANALISES, pasta_extratos, caminho_historico)
+    abaMonitor(ANALISES, pasta_extratos)
 
 fonteDados()
 

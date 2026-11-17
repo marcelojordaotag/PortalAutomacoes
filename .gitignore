@@ -1,30 +1,31 @@
+# A pasta env/ é versionada: .env.local, .env.hom e .env.prd têm só configuração.
+# Segredo local fica em env/.env.segredo, que não vai para o git.
+
+# Segredos e credenciais
+**/credenciais/
+service_account.json
+**/env/.env.segredo
+
+# Dados de execução — entrada e saída do processamento.
+# Arquivo de apoio (parametrização, de-para, layout, template) NÃO fica aqui:
+# fica dentro do projeto e é versionado normalmente.
+dados/
+entrada/
+saida/
+
+# Binários pesados
+*.zip
+*.exe
+*.dmp
+*.bak
+
+# Python
 __pycache__/
-*.py[cod]
-.venv/
-.env
-.env.*
-*.log
-.streamlit/secrets.toml
-.claude/
+*.pyc
+venv/
 
-# Britech: segredos e arquivos gerados pela busca na API
-portal/apps/britech/.env
-portal/apps/britech/Relatorio_Rentabilidade.xlsx
-portal/apps/britech/Rentabilidade_Tratada.xlsx
-portal/apps/britech/Historico_Cotas.csv
-portal/apps/britech/extratos/
-portal/apps/britech/Monitor_Cotas_*.xlsx
-
-# Dados reais e apoio local — não versionar (padrões TAG)
-docs/*.pdf
-portal/apps/**/*.pdf
-portal/apps/boletador/controle_erros*.json
-portal/apps/boletador/backups_erros/
-portal/apps/boletador/snapshot_ata.json
-portal/apps/britech/ids_cliente.xlsx
-portal/apps/extratos/Extratos/
-portal/apps/extratos/*-bkp.xlsx
-
-# Ambiente de rede: segredos e dados reais
-portal/env/
-portal/dados/
+# IDE e editor
+.idea/
+.vscode/
+.claude/settings.local.json
+.claude/worktrees/

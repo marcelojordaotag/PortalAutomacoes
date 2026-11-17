@@ -20,7 +20,7 @@ os.environ.setdefault("APP_ENV", "local")
 import navegador  # noqa: E402
 from app.paginas.crava_cotas import slack_crava  # noqa: E402
 
-ARQUIVO_LOG = navegador.ARQUIVO_TABELA.with_name("aviso_automatico.log")
+ARQUIVO_LOG = RAIZ_PORTAL / "dados" / "crava_cotas" / "aviso_automatico.log"
 
 
 def registrar(texto):

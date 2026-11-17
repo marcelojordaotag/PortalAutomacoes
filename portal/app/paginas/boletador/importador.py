@@ -18,11 +18,8 @@ PASTA_DESTINO = Path(__file__).resolve().parents[3] / "dados" / "boletador" / "d
 MARCADOR_ARQUIVO = "ARQUIVO::"  # o subprocesso imprime o caminho do arquivo com esse prefixo
 
 
-def importarBase(url=None, data_inicial=None, data_final=None):
-    """Abre o boletador, espera o login, navega até Ordens e baixa a base.
-
-    Se `url` for informada, ela vale no lugar de BOLETADOR_PRC_URL.
-    `data_inicial` e `data_final` (dd/mm/aaaa) preenchem o período da operação antes de exportar."""
+def importarBase():
+    """Abre o boletador, espera o login, navega até Ordens e baixa a base."""
     from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
     from playwright.sync_api import sync_playwright
 
@@ -35,7 +32,7 @@ def importarBase(url=None, data_inicial=None, data_final=None):
 
         try:
             pagina_atual = contexto.pages[0] if contexto.pages else contexto.new_page()
-            pagina_atual.goto(url or URL_BOLETADOR)
+            pagina_atual.goto(URL_BOLETADOR)
 
             # O login termina quando o ícone de menu aparece na tela
             icone_menu = pagina_atual.locator('i.material-icons[title="Menu"]')
@@ -44,44 +41,18 @@ def importarBase(url=None, data_inicial=None, data_final=None):
             except PlaywrightTimeoutError:
                 sys.exit(2)
 
-            # Se uma URL específica foi pedida e o login redirecionou para outra tela, volta para ela
-            if url and not pagina_atual.url.startswith(url):
-                pagina_atual.goto(url)
+            # Navega para Cadastros > Ordens
+            ordens = pagina_atual.locator('a:text-is("Ordens"):visible').first
 
-            # Dá 3 segundos para o Angular carregar a tela inicial
+            if not ordens.is_visible():  # só abre "Cadastros" se o submenu ainda estiver fechado
+                pagina_atual.locator("#itemCadastros").click()
+            ordens.click()
+
+            # Dá 3 segundos para o Angular carregar completamente a tabela e os componentes visuais
             pagina_atual.wait_for_timeout(3000)
 
+            # 1. Pega o PRIMEIRO botão visível
             download = pagina_atual.locator('button[title="Exportar"]').first
-
-            # Se o botão Exportar não estiver na tela inicial, navega para Cadastros > Ordens
-            if not download.is_visible():
-                ordens = pagina_atual.locator('a:text-is("Ordens"):visible').first
-                if not ordens.is_visible():  # só abre "Cadastros" se o submenu ainda estiver fechado
-                    pagina_atual.locator("#itemCadastros").click()
-                ordens.click()
-                pagina_atual.wait_for_timeout(3000)  # Angular carregar a tabela
-
-            # Preenche o período da operação, quando informado
-            if data_inicial and data_final:
-                campo_inicial = pagina_atual.locator("#dtOperacaoDe")
-                campo_final = (
-                    pagina_atual.locator('#dtOperacaoAte, input[name="dtOperacaoAte"]')
-                    .or_(pagina_atual.locator('xpath=//label[contains(., "Período Final da Operação")]/following::input[1]'))
-                    .first
-                )
-                for campo, valor in ((campo_inicial, data_inicial), (campo_final, data_final)):
-                    campo.click()
-                    campo.fill(valor)
-                    campo.press("Enter")
-                    pagina_atual.keyboard.press("Escape")  # fecha o calendário
-                pagina_atual.locator("body").click(position={"x": 5, "y": 5})
-                # Aplica o filtro, se a tela tiver botão de pesquisa
-                pesquisar = pagina_atual.locator('button[title="Pesquisar"]').first
-                if pesquisar.is_visible():
-                    pesquisar.click()
-                pagina_atual.wait_for_timeout(3000)
-
-            # 1. Espera o botão Exportar (ícone archive) ficar visível
             download.wait_for(state="visible", timeout=15000)
 
             print("Botão encontrado! Tentando clicar via JavaScript...")
@@ -122,5 +93,4 @@ def importarBase(url=None, data_inicial=None, data_final=None):
 
 
 if __name__ == "__main__":
-    argumentos = sys.argv[1:] + [None, None, None]
-    importarBase(argumentos[0], argumentos[1], argumentos[2])
+    importarBase()

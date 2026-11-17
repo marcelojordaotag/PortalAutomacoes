@@ -1,6 +1,6 @@
 """Busca os dados das carteiras na API Britech e grava o Relatorio_Rentabilidade.xlsx + os extratos de conta corrente.
 
-Uso na linha de comando (le os IDs de ids_cliente.xlsx):
+Uso na linha de comando (le os IDs da tabela tb_britech_carteira):
     python -m app.api.api_britech
 
 Uso pela página (pagina.py): o app escolhe os IDs e o periodo e chama buscar_dados().
@@ -13,6 +13,8 @@ import pandas as pd
 import requests
 
 from app.ambiente.config_ambiente import obterDiretorioDados
+from app.database.carteiras import listarIdsCarteiras
+from app.database.historico_cotas import COLUNAS_HISTORICO, substituirHistorico
 
 BASE_URL = os.environ.get("API_PRC_URL", "")
 
@@ -20,7 +22,6 @@ USUARIO = os.environ.get("API_PRC_USUARIO", "")
 SENHA = os.environ.get("API_PRC_SENHA", "")
 
 PASTA = obterDiretorioDados("britech")
-ARQUIVO_IDS = PASTA / "ids_cliente.xlsx"
 ARQUIVO_SAIDA = PASTA / "Relatorio_Rentabilidade.xlsx"
 PASTA_EXTRATOS = PASTA / "extratos"
 DATA_INICIO_PADRAO = "2026-07-31"
@@ -28,9 +29,7 @@ DATA_FIM_PADRAO = "2026-08-31"
 
 # Historico de cotas para o Monitor de cotas (precisa de bem mais dias que a conferencia: as janelas de 252 e 126
 # dias so comecam a classificar depois de metade da janela)
-ARQUIVO_HISTORICO = PASTA / "Historico_Cotas.csv"
 HISTORICO_DIAS_PADRAO = 730  # 2 anos antes da data final
-COLUNAS_HISTORICO = ["Data", "IdCarteira", "CotaBruta", "PLFechamento", "QuantidadeFechamento"]
 
 # Tempo limite das chamadas (segundos): (conectar, esperar resposta). Sem isso, uma API que trava
 # deixa o programa esperando para sempre (no app, o botao "Buscar na API" ficaria preso).
@@ -121,15 +120,6 @@ class AtlasPasAPI:
         return self._executarGet("api/Fundo/OperacaoCotistaAnalitico_PorCarteiraPeriodo",{"IdsCarteiras": id_cliente, "DataInicio": data_inicio, "DataFim": data_fim})
 
 
-def lerIds(arquivo=ARQUIVO_IDS):
-    """IDs da coluna id_cliente da planilha (sem repeticao). Lista vazia se a planilha nao existir."""
-    arquivo = Path(arquivo)
-    if not arquivo.exists():
-        return []
-    return (pd.read_excel(arquivo, dtype=str)["id_cliente"]
-            .dropna().str.strip().drop_duplicates().tolist())
-
-
 def montarConsultas(api):
     """aba do Excel -> consulta da API. As duas ultimas explicam divergencias de PL (movimentacao de cotistas)."""
     return {
@@ -142,8 +132,8 @@ def montarConsultas(api):
     }
 
 
-def _executarHistorico(clientes, data_inicio, data_fim, arquivo_saida, api, progresso):
-    """Uma chamada por carteira (BuscaHistoricoCotaDia) e um CSV com Data, IdCarteira, CotaBruta, PL e quantidade de cotas."""
+def _executarHistorico(clientes, data_inicio, data_fim, api, progresso):
+    """Uma chamada por carteira (BuscaHistoricoCotaDia) e grava no banco (substitui todo o histórico) com Data, IdCarteira, CotaBruta, PL e quantidade de cotas."""
     quadros, sem_dados = [], []
     for ordem_item, cliente in enumerate(clientes):
         if progresso:
@@ -162,19 +152,12 @@ def _executarHistorico(clientes, data_inicio, data_fim, arquivo_saida, api, prog
         raise RuntimeError("A API não devolveu histórico de cotas para nenhuma carteira.")
     historico = pd.concat(quadros, ignore_index=True)
     historico["Data"] = pd.to_datetime(historico["Data"]).dt.strftime("%Y-%m-%d")
-    arquivo_saida.parent.mkdir(parents=True, exist_ok=True)
-    temporario = arquivo_saida.with_name(arquivo_saida.stem + ".tmp.csv")
-    historico.to_csv(temporario, index=False)
-    try:
-        os.replace(temporario, arquivo_saida)
-    except PermissionError:
-        temporario.unlink(missing_ok=True)
-        raise PermissionError(f"Não consegui gravar {arquivo_saida.name}. Feche o arquivo e tente de novo.")
-    return {"arquivo": str(arquivo_saida), "linhas": len(historico),
+    substituirHistorico(historico)
+    return {"arquivo": "tb_britech_historico_cota", "linhas": len(historico),
             "carteiras": [id_carteira for id_carteira in clientes if id_carteira not in sem_dados], "sem_dados": sem_dados}
 
 
-def buscarHistoricoCotas(clientes, data_inicio, data_fim, arquivo_saida=ARQUIVO_HISTORICO,
+def buscarHistoricoCotas(clientes, data_inicio, data_fim,
                            api = None,
                            progresso = None):
     """Busca so o historico de cotas (para o Monitor de cotas). Mesmas regras de erro e de fechamento de buscar_dados()."""
@@ -187,7 +170,7 @@ def buscarHistoricoCotas(clientes, data_inicio, data_fim, arquivo_saida=ARQUIVO_
     propria = api is None
     api = api or AtlasPasAPI(BASE_URL, USUARIO, SENHA)
     try:
-        return _executarHistorico(clientes, data_inicio, data_fim, Path(arquivo_saida), api, progresso)
+        return _executarHistorico(clientes, data_inicio, data_fim, api, progresso)
     finally:
         if propria:
             api.close()
@@ -196,7 +179,7 @@ def buscarHistoricoCotas(clientes, data_inicio, data_fim, arquivo_saida=ARQUIVO_
 def buscarDados(clientes, data_inicio, data_fim, arquivo_saida=ARQUIVO_SAIDA, pasta_extratos=PASTA_EXTRATOS,
                  api = None,
                  progresso = None,
-                 historico_inicio=None, arquivo_historico=ARQUIVO_HISTORICO):
+                 historico_inicio=None):
     """Busca as carteiras na API e grava o Excel e os extratos.
 
     clientes          - lista de IDs
@@ -224,14 +207,14 @@ def buscarDados(clientes, data_inicio, data_fim, arquivo_saida=ARQUIVO_SAIDA, pa
     api = api or AtlasPasAPI(BASE_URL, USUARIO, SENHA)
     try:
         return _executarBusca(clientes, data_inicio, data_fim, Path(arquivo_saida), Path(pasta_extratos), api, progresso,
-                               historico_inicio, Path(arquivo_historico))
+                               historico_inicio)
     finally:
         if propria:
             api.close()
 
 
 def _executarBusca(clientes, data_inicio, data_fim, arquivo_saida, pasta_extratos, api,
-                    progresso, historico_inicio=None, arquivo_historico = ARQUIVO_HISTORICO):
+                    progresso, historico_inicio=None):
     consultas = montarConsultas(api)
     total = len(clientes) * (len(consultas) + 1 + (1 if historico_inicio else 0))
     feitos = 0
@@ -296,7 +279,7 @@ def _executarBusca(clientes, data_inicio, data_fim, arquivo_saida, pasta_extrato
                 progresso(min((base + fracao * len(clientes)) / total, 1.0), texto)
 
         try:
-            historico = _executarHistorico(clientes, historico_inicio, data_fim, arquivo_historico, api, progressoHistorico)
+            historico = _executarHistorico(clientes, historico_inicio, data_fim, api, progressoHistorico)
         except (RuntimeError, ValueError, PermissionError) as excecao:
             historico = {"erro": str(excecao)}
 
@@ -307,8 +290,8 @@ def _executarBusca(clientes, data_inicio, data_fim, arquivo_saida, pasta_extrato
 
 
 def main():
-    clientes = lerIds()
-    print(f"{len(clientes)} carteiras lidas de {ARQUIVO_IDS}")
+    clientes = listarIdsCarteiras()
+    print(f"{len(clientes)} carteiras lidas de tb_britech_carteira")
     historico_inicio = (date.fromisoformat(DATA_FIM_PADRAO) - timedelta(days=HISTORICO_DIAS_PADRAO)).isoformat()
     try:
         resultado = buscarDados(clientes, DATA_INICIO_PADRAO, DATA_FIM_PADRAO, historico_inicio=historico_inicio)

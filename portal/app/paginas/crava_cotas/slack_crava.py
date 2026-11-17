@@ -2,6 +2,7 @@
 import json
 
 import pandas as pd
+import requests
 
 from app.ambiente.config_ambiente import obterVariavel
 from app.utilitarias.limite_slack import liberarConteudo, postarComLimite, segundosParaRepetir
@@ -53,6 +54,18 @@ def postarSlack(token, payload):
     return resposta.json()
 
 
+def nomeDoCanal(token, canal):
+    """'#nome' do canal: se a variável já tem o nome, usa ele; se for ID, tenta consultar o Slack (precisa do escopo channels:read), senão mostra o ID."""
+    if not canal[:1] in ("C", "G") or not canal.isalnum() or not canal.isupper():
+        return canal if canal.startswith("#") else f"#{canal}"
+    try:
+        resposta = requests.get("https://slack.com/api/conversations.info", headers={"Authorization": f"Bearer {token}"},
+                                params={"channel": canal}, timeout=10).json()
+        return f"#{resposta['channel']['name']}" if resposta.get("ok") else canal
+    except Exception:
+        return canal
+
+
 def enviarSlack(mensagens):
     """Posta as mensagens no canal pela API do Slack (bot token). Devolve (ok, mensagem)."""
     token = obterVariavel("SLACK_BOT_TOKEN_CRAVA_COTAS")
@@ -77,7 +90,7 @@ def enviarSlack(mensagens):
             if not resposta.get("ok"):
                 liberarConteudo(conteudo)
                 return False, f"O Slack respondeu: {resposta.get('error')} {resposta.get('response_metadata', '')}"
-        return True, "Enviado ao Slack."
+        return True, f"Enviado ao Slack no canal {nomeDoCanal(token, canal)}."
     except Exception as excecao:
         liberarConteudo(conteudo)
         return False, f"Não foi possível enviar: {excecao}"

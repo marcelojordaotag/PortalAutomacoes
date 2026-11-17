@@ -10,11 +10,9 @@ import sys
 import venv
 
 pasta_codigo = os.path.dirname(os.path.abspath(__file__))
-# Pasta compartilhada: o venv fica por usuário (um venv não funciona em outra máquina)
-pasta_venv = os.environ.get("PORTAL_VENV") or os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "PortalTAG", "venv")
-os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+pasta_venv = os.path.join(os.path.dirname(pasta_codigo), "venv")
 arquivo_requirements = os.path.join(pasta_codigo, "requirements.txt")
-python_venv = os.path.join(pasta_venv, "Scripts" if os.name == "nt" else "bin", "python")
+python_venv = os.path.join(pasta_venv, "Scripts" if os.name == "nt" else "bin", "python.exe" if os.name == "nt" else "python")
 
 
 def executar(*lista_argumentos):
@@ -26,6 +24,11 @@ def chromiumInstalado():
         os.environ.get("LOCALAPPDATA", ""), "ms-playwright"
     )
     return bool(glob.glob(os.path.join(pasta_base, "chromium-*")))
+
+
+def bibliotecasPrincipaisOk():
+    """True se o venv já tem o essencial instalado (mesmo que o pip não consiga aplicar as versões fixadas)."""
+    return executar("-c", "import streamlit, pandas, mysql.connector, decouple") == 0
 
 
 def erro():
@@ -42,19 +45,11 @@ def main():
         print(f"Criando ambiente virtual em {pasta_venv}...")
         venv.create(pasta_venv, with_pip=True)
 
-    arquivo_instalar = arquivo_requirements
-    if sys.version_info[:2] >= (3, 11):
-        # Python 3.12: pandas/numpy fixados para 3.10 não instalam; usa as versões testadas no 3.12
-        with open(arquivo_requirements, encoding="utf-8") as arq:
-            texto = arq.read()
-        texto = texto.replace("pandas==1.5.3", "pandas==2.2.3").replace("numpy==1.24.1", "numpy==1.26.4")
-        arquivo_instalar = os.path.join(pasta_venv, "requirements_py312.txt")
-        with open(arquivo_instalar, "w", encoding="utf-8") as arq:
-            arq.write(texto)
-
     print("Conferindo bibliotecas...")
-    if executar("-m", "pip", "install", "-q", "-r", arquivo_instalar) != 0:
-        return erro()
+    if executar("-m", "pip", "install", "-q", "-r", arquivo_requirements) != 0:
+        if not bibliotecasPrincipaisOk():
+            return erro()
+        print("Aviso: o pip não aplicou as versões fixadas (comum fora do Python 3.10); seguindo com as já instaladas.")
 
     if not chromiumInstalado():
         print("Instalando Chromium do Playwright...")

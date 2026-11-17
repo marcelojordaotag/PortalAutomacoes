@@ -2,15 +2,17 @@ import html
 from datetime import date, timedelta
 
 import pandas as pd
-import plotly.express as px
 import streamlit as st
 
-from app.utilitarias.tema import COR, aplicarTema, estilizarFigura, topo
+from app.utilitarias import email_gmail
+from app.utilitarias.tema import COR, aplicarTema, topo
+
+from app.paginas.solicitacoes.graficos import grafico
 
 from app.paginas.solicitacoes.comum import (
-    CLASSE_STATUS, EMAIL_CC, PRIORIDADES, SLA_DIAS, SLA_URGENTE_DIAS, STATUS, TIPOS, URGENTE_BADGE,
-    abrirEmail, canonSolicitante, carregar, carregarClientes, diasEntre, evento, nomeCurto, paraDf,
-    previsaoConclusao, salvar, textoPrevisao,
+    CLASSE_STATUS, EMAIL_CC, EMAIL_PARA, PRIORIDADES, SLA_DIAS, SLA_URGENTE_DIAS, STATUS, TIPOS, URGENTE_BADGE,
+    abrirEmail, canonSolicitante, carregar, carregarClientes, criarRascunhoGmail, diasEntre, evento, nomeCurto, paraDf,
+    neutralizarFormulas, previsaoConclusao, salvarSolicitacao, salvarSolicitacoes, textoPrevisao,
 )
 
 aplicarTema()
@@ -32,33 +34,23 @@ st.markdown(
 
 
 def abrirEmailConclusao(reg, para, cc):
-    """Abre no Outlook o rascunho avisando que a solicitação foi concluída (não envia)."""
-    try:
-        import win32com.client
-        aplicativo_outlook = win32com.client.Dispatch("Outlook.Application")
-        mensagem_email = aplicativo_outlook.CreateItem(0)
-    except Exception as erro:  # noqa: BLE001
-        return False, f"Não consegui acessar o Outlook: {erro}"
-    mensagem_email.To = para
-    mensagem_email.CC = cc
-    mensagem_email.Subject = f"SOLICITAÇÃO CONCLUÍDA : {nomeCurto(reg['cliente'])}"
-    mensagem_email.Body = (
+    """Cria no Gmail o rascunho avisando que a solicitação foi concluída (não envia)."""
+    ds_texto = (
         "Olá,\n\nSua solicitação foi concluída:\n\n"
         f"CLIENTE: {reg['cliente']}\nTIPO: {reg.get('tipo', '')}\nDESCRIÇÃO: {reg.get('descricao', '')}\n"
         f"CONCLUÍDA EM: {date.fromisoformat(reg['data_conclusao']).strftime('%d/%m/%Y')}\n\n"
         f"COMO FOI RESOLVIDA:\n{reg.get('resolucao', '')}\n\nAtenciosamente,"
     )
-    mensagem_email.Display()
-    return True, "Rascunho de conclusão aberto no Outlook."
+    return criarRascunhoGmail(email_gmail.montarMimeTexto(para, f"SOLICITAÇÃO CONCLUÍDA : {nomeCurto(reg['cliente'])}", ds_texto, cc or ""))
 
 
 # ---------------------------------------------------------------- estado
-# Sempre do disco: pessoas de outras áreas registram solicitações em Registro Solicitações de Fechamento enquanto esta tela está aberta.
+# Sempre do banco: pessoas de outras áreas registram solicitações em Registro Solicitações de Fechamento enquanto esta tela está aberta.
 regs = carregar()
 st.session_state.regs = regs
 df = paraDf(regs)
 
-aba_painel, aba_concluir, aba_lista = st.tabs(["Painel", "Concluir solicitação", "Solicitações e histórico"])
+aba_concluir, aba_painel, aba_lista = st.tabs(["Concluir solicitação", "Painel", "Solicitações e histórico"])
 
 # ---------------------------------------------------------------- PAINEL
 def kpi(nm_rotulo, valor, sub="", classe="", fonte=""):
@@ -69,11 +61,6 @@ def kpi(nm_rotulo, valor, sub="", classe="", fonte=""):
 
 def faixaKpis(titulo, itens):
     st.markdown(f'<p class="faixa-titulo">{titulo}</p><div class="kpis">{"".join(itens)}</div>', unsafe_allow_html=True)
-
-
-def grafico(figura, titulo):
-    estilizarFigura(figura, titulo)
-    st.plotly_chart(figura, use_container_width=True, config={"displayModeBar": False})
 
 
 def pct(parte, total):
@@ -144,21 +131,20 @@ with aba_painel:
             ])
 
             sub_geral, sub_prazos, sub_tempo, sub_pessoas = st.tabs(
-                ["Visão geral", "Prazos e backlog", "Tempo de conclusão", "Solicitantes e clientes"])
+                ["Visão geral", "Prazos e backlog", "Tempo de conclusão", "Solicitantes e c,"
+                ";çpp´~lientes"])
 
             # ---------------- Visão geral
             with sub_geral:
                 g1, g2 = st.columns([3, 2])
                 with g1:
                     por_mes = base.groupby(["Mês", "Status"]).size().reset_index(name="Qtd")
-                    figura = px.bar(por_mes, x="Mês", y="Qtd", color="Status", barmode="stack", color_discrete_map=COR_STATUS,
-                                 category_orders={"Status": STATUS})
-                    grafico(figura, "Solicitações por mês e status")
+                    grafico("bar", por_mes, "Solicitações por mês e status", x="Mês", y="Qtd", color="Status", barmode="stack",
+                            color_discrete_map=COR_STATUS, category_orders={"Status": STATUS})
                 with g2:
                     por_tipo = base.groupby("Tipo").size().reset_index(name="Qtd")
-                    figura = px.pie(por_tipo, names="Tipo", values="Qtd", hole=.55,
-                                 color_discrete_sequence=[COR["vinho"], COR["dourado"], COR["vinho_medio"]])
-                    grafico(figura, "Por tipo de demanda")
+                    grafico("pie", por_tipo, "Por tipo de demanda", names="Tipo", values="Qtd", hole=.55,
+                            color_discrete_sequence=[COR["vinho"], COR["dourado"], COR["vinho_medio"]])
 
                 if True:
                     ab_sem = base.set_index("Data_dt").resample("W-MON", label="left", closed="left").size().rename("Abertas")
@@ -170,9 +156,8 @@ with aba_painel:
                         co_sem = co.set_index("Conclusão_dt").resample("W-MON", label="left", closed="left").size().rename("Concluídas")
                     sem = pd.concat([ab_sem, co_sem], axis=1).fillna(0).astype(int).reset_index(names="Semana")
                     sem_l = sem.melt("Semana", var_name="Série", value_name="Qtd")
-                    figura = px.line(sem_l, x="Semana", y="Qtd", color="Série", markers=True,
-                                  color_discrete_map={"Abertas": COR["vinho"], "Concluídas": COR["ok"]})
-                    grafico(figura, "Aberturas × conclusões por semana")
+                    grafico("line", sem_l, "Aberturas × conclusões por semana", x="Semana", y="Qtd", color="Série", markers=True,
+                            color_discrete_map={"Abertas": COR["vinho"], "Concluídas": COR["ok"]})
 
             # ---------------- Prazos e backlog
             with sub_prazos:
@@ -182,11 +167,10 @@ with aba_painel:
                         idade = pd.cut(abertas["Aberta há (dias)"].astype(float), bins=[-1, 2, 5, 10, 20, float("inf")],
                                        labels=ORDEM_IDADE).astype(str).value_counts().reindex(ORDEM_IDADE, fill_value=0)
                         idade_df = pd.DataFrame({"Idade": ORDEM_IDADE, "Qtd": idade.values})
-                        figura = px.bar(idade_df, x="Idade", y="Qtd", text="Qtd", color="Idade",
-                                     color_discrete_sequence=[COR["ok"], "#8DB255", COR["alerta"], "#D2691E", COR["div"]])
-                        figura.update_traces(textposition="outside")
-                        figura.update_layout(showlegend=False)
-                        grafico(figura, "Backlog por idade (não concluídas)")
+                        grafico("bar", idade_df, "Backlog por idade (não concluídas)",
+                                ajustes=[("update_traces", (), {"textposition": "outside"}), ("update_layout", (), {"showlegend": False})],
+                                x="Idade", y="Qtd", text="Qtd", color="Idade",
+                                color_discrete_sequence=[COR["ok"], "#8DB255", COR["alerta"], "#D2691E", COR["div"]])
                     else:
                         st.success("Nenhuma solicitação pendente.")
                 with b2:
@@ -195,10 +179,9 @@ with aba_painel:
                                     .groupby("Tipo")["ok"].agg(["mean", "count"]).reset_index())
                         sla_tipo["Cumprimento (%)"] = (sla_tipo["mean"] * 100).round(0)
                         sla_tipo["Rótulo"] = sla_tipo.apply(lambda linha_sla: f"{linha_sla['Cumprimento (%)']:.0f}% ({int(linha_sla['count'])})", axis=1)
-                        figura = px.bar(sla_tipo, x="Tipo", y="Cumprimento (%)", text="Rótulo", color_discrete_sequence=[COR["vinho"]])
-                        figura.update_traces(textposition="outside")
-                        figura.update_yaxes(range=[0, 115])
-                        grafico(figura, "Cumprimento do SLA por tipo (% · concluídas)")
+                        grafico("bar", sla_tipo, "Cumprimento do SLA por tipo (% · concluídas)",
+                                ajustes=[("update_traces", (), {"textposition": "outside"}), ("update_yaxes", (), {"range": [0, 115]})],
+                                x="Tipo", y="Cumprimento (%)", text="Rótulo", color_discrete_sequence=[COR["vinho"]])
                     else:
                         st.info("Sem concluídas para medir o cumprimento do SLA.")
 
@@ -219,28 +202,25 @@ with aba_painel:
                     with t1:
                         tm_mes = concl.groupby("Mês")["Dias p/ concluir"].agg(["mean", "median"]).round(1).reset_index()
                         tm_l = tm_mes.melt("Mês", var_name="Medida", value_name="Dias").replace({"mean": "Média", "median": "Mediana"})
-                        figura = px.bar(tm_l, x="Mês", y="Dias", color="Medida", barmode="group", text="Dias",
-                                     color_discrete_map={"Média": COR["vinho"], "Mediana": COR["dourado"]})
-                        figura.update_traces(textposition="outside")
-                        grafico(figura, "Dias para concluir por mês de abertura")
+                        grafico("bar", tm_l, "Dias para concluir por mês de abertura", ajustes=[("update_traces", (), {"textposition": "outside"})],
+                                x="Mês", y="Dias", color="Medida", barmode="group", text="Dias",
+                                color_discrete_map={"Média": COR["vinho"], "Mediana": COR["dourado"]})
                     with t2:
                         cc_f = concl.dropna(subset=["Dias p/ concluir"]).copy()
                         cc_f["Faixa"] = pd.cut(cc_f["Dias p/ concluir"], bins=[-1, 0, 1, 3, 7, 15, float("inf")],
                                                labels=ORDEM_FAIXAS_DIAS).astype(str)
                         dist = cc_f["Faixa"].value_counts().reindex(ORDEM_FAIXAS_DIAS, fill_value=0)
                         dist_df = pd.DataFrame({"Faixa": ORDEM_FAIXAS_DIAS, "Qtd": dist.values})
-                        figura = px.bar(dist_df, x="Faixa", y="Qtd", text="Qtd", color_discrete_sequence=[COR["vinho"]])
-                        figura.update_traces(textposition="outside")
-                        grafico(figura, "Distribuição: quantas concluíram em cada faixa")
+                        grafico("bar", dist_df, "Distribuição: quantas concluíram em cada faixa", ajustes=[("update_traces", (), {"textposition": "outside"})],
+                                x="Faixa", y="Qtd", text="Qtd", color_discrete_sequence=[COR["vinho"]])
 
             # ---------------- Solicitantes e clientes
             with sub_pessoas:
                 if True:
                     por_cli = base.groupby("Cliente").size().reset_index(name="Qtd").sort_values("Qtd").tail(10)
                     por_cli["Cliente"] = por_cli["Cliente"].map(nomeCurto)
-                    figura = px.bar(por_cli, x="Qtd", y="Cliente", orientation="h", text="Qtd", color_discrete_sequence=[COR["dourado"]])
-                    figura.update_traces(textposition="outside")
-                    grafico(figura, "Clientes com mais solicitações (top 10)")
+                    grafico("bar", por_cli, "Clientes com mais solicitações (top 10)", ajustes=[("update_traces", (), {"textposition": "outside"})],
+                            x="Qtd", y="Cliente", orientation="h", text="Qtd", color_discrete_sequence=[COR["dourado"]])
 
                 st.markdown('<p class="secao">Clientes reincidentes</p>'
                             '<p class="secao-sub">Clientes com 2 ou mais solicitações no período: bom ponto de partida para achar a causa raiz</p>',
@@ -274,12 +254,10 @@ with aba_concluir:
                 unsafe_allow_html=True)
         resolucao = st.text_area("Como foi resolvida", height=130, key=f"conc_res_{cv}")
         data_fim = st.date_input("Data de conclusão", value=date.today(), format="DD/MM/YYYY", key=f"conc_data_{cv}")
-        enviar = st.checkbox("Abrir rascunho do e-mail de conclusão no Outlook", value=True, key=f"conc_mail_{cv}")
-        em1, em2 = st.columns(2)
-        email_para = em1.text_input("E-mail para (destinatário)", value=(escolhida or {}).get("email_solicitante", ""),
+        enviar = st.checkbox("Criar rascunho do e-mail de conclusão no Gmail", value=True, key=f"conc_mail_{cv}")
+        email_para = st.text_input("E-mail para (destinatário)", value=EMAIL_PARA or "",
                                     placeholder="nome@taginvest.com.br", disabled=not enviar,
                                     key=f"conc_para_{cv}_{(escolhida or {}).get('id', 0)}")
-        email_cc = em2.text_input("Com cópia (CC)", value=EMAIL_CC, disabled=not enviar, key=f"conc_cc_{cv}")
         if enviar and escolhida:
             st.caption(f"Assunto: SOLICITAÇÃO CONCLUÍDA : {nomeCurto(escolhida['cliente'])}")
         if st.button("Marcar como concluída", type="primary", key=f"conc_btn_{cv}"):
@@ -298,11 +276,11 @@ with aba_concluir:
                 texto_mensagem = f"Solicitação #{reg_c['id']} concluída."
                 if enviar:
                     reg_c["email_solicitante"] = email_para.strip()
-                    ok, texto = abrirEmailConclusao(reg_c, email_para.strip(), email_cc.strip())
-                    evento(reg_c, "Rascunho de e-mail de conclusão aberto" if ok else "Falha ao abrir e-mail de conclusão",
+                    ok, texto = abrirEmailConclusao(reg_c, email_para.strip(), EMAIL_CC)
+                    evento(reg_c, "Rascunho de e-mail de conclusão criado" if ok else "Falha ao criar e-mail de conclusão",
                            f"Para: {email_para.strip()}" if ok else texto)
                     texto_mensagem += " " + texto
-                salvar(regs)
+                salvarSolicitacao(reg_c)
                 st.session_state.concluir_v = cv + 1
                 st.session_state.aviso_concluir = texto_mensagem
                 st.rerun()
@@ -369,19 +347,19 @@ with aba_lista:
                 data_lote = l1.date_input("Data de conclusão", value=date.today(), format="DD/MM/YYYY", key=f"dlote_{lv}")
                 l2.write("")
                 if l2.button(f"Concluir {len(marcadas)} selecionada(s)", disabled=not marcadas, key=f"blote_{lv}"):
-                    for solicitacao_lote in regs:
-                        if solicitacao_lote["id"] in marcadas:
-                            evento(solicitacao_lote, f"Status: {solicitacao_lote['status']} → Concluído", "Baixa em lote")
-                            solicitacao_lote["status"] = "Concluído"
-                            solicitacao_lote["data_conclusao"] = data_lote.isoformat()
-                    salvar(regs)
+                    lote_baixa = [solicitacao_lote for solicitacao_lote in regs if solicitacao_lote["id"] in marcadas]
+                    for solicitacao_lote in lote_baixa:
+                        evento(solicitacao_lote, f"Status: {solicitacao_lote['status']} → Concluído", "Baixa em lote")
+                        solicitacao_lote["status"] = "Concluído"
+                        solicitacao_lote["data_conclusao"] = data_lote.isoformat()
+                    salvarSolicitacoes(lote_baixa)
                     st.session_state.lote_v = lv + 1
                     st.session_state.aviso_lista = f"{len(marcadas)} solicitação(ões) concluída(s)."
                     st.rerun()
         if "aviso_lista" in st.session_state:
             st.success(st.session_state.pop("aviso_lista"))
 
-        st.download_button("Exportar visão filtrada (CSV)", vis.drop(columns=["Data_dt"]).to_csv(index=False, sep=";").encode("utf-8-sig"),
+        st.download_button("Exportar visão filtrada (CSV)", neutralizarFormulas(vis.drop(columns=["Data_dt"])).to_csv(index=False, sep=";").encode("utf-8-sig"),
                            "solicitacoes.csv", "text/csv")
 
         linhas = selecao.selection.rows if selecao and selecao.selection else []
@@ -427,7 +405,7 @@ with aba_lista:
                         evento(reg, "Comentário", comentario.strip())
                         mudou = True
                     if mudou:
-                        salvar(regs)
+                        salvarSolicitacao(reg)
                         st.session_state.aviso_lista = f"Solicitação #{rid} atualizada."
                         st.rerun()
                     else:
@@ -454,15 +432,15 @@ with aba_lista:
                         elif alterados:
                             reg.update(novos)
                             evento(reg, "Dados editados", " | ".join(alterados))
-                            salvar(regs)
+                            salvarSolicitacao(reg)
                             st.session_state.aviso_lista = f"Solicitação #{rid} editada."
                             st.rerun()
                         else:
                             st.info("Nenhuma alteração.")
                 if b2.button("Reabrir rascunho do e-mail", key=f"reemail_{rid}"):
                     ok, texto = abrirEmail(reg)
-                    evento(reg, "Rascunho de e-mail aberto" if ok else "Falha ao abrir e-mail", "" if ok else texto)
-                    salvar(regs)
+                    evento(reg, "Rascunho de e-mail criado" if ok else "Falha ao criar e-mail", "" if ok else texto)
+                    salvarSolicitacao(reg)
                     (st.success if ok else st.error)(texto)
             with dir_:
                 st.markdown("**Histórico**")

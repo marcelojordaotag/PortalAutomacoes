@@ -61,7 +61,8 @@ def carregarSegredosParameterStore():
 
 def validarVariaveisObrigatorias():
     lista_obrigatorias = ["EMAIL_PARA_SOLICITACOES", "EMAIL_CC_SOLICITACOES", "API_PRC_URL", "BOLETADOR_PRC_URL",
-                         "OFFSHORE_BKO_PASTA_HISTORICO", "OFFSHORE_BKO_ARQUIVO_MODELO"]
+                         "DRIVE_BKO_PASTA_HISTORICO", "DRIVE_BKO_ARQUIVO_MODELO", "DRIVE_BKO_PASTA_EXTRATOS",
+                         "PATH_CREDENCIAIS_GMAIL", "URL_PORTAL"]
     if APP_ENV in {"hom", "prd"}:
         lista_obrigatorias.append("PORTAL_SEGREDO")
     lista_ausentes = [nm_variavel for nm_variavel in lista_obrigatorias if not os.getenv(nm_variavel)]

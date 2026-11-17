@@ -204,6 +204,16 @@ button[data-testid="stBaseButton-secondary"]:disabled, button[data-testid="stBas
 }
 button[data-testid="stBaseButton-secondary"]:disabled * { color: #FFFFFF !important; }
 
+/* Botões de link (st.link_button): mesmo visual dos botões, com texto branco */
+a[data-testid="stBaseLinkButton-secondary"], a[data-testid="stBaseLinkButton-primary"] {
+    background: __VINHO__ !important; border: 1px solid __VINHO__ !important; border-radius: 10px !important;
+    color: #fff !important; font-weight: 600 !important; text-decoration: none !important; transition: all .15s ease;
+}
+a[data-testid="stBaseLinkButton-secondary"] *, a[data-testid="stBaseLinkButton-primary"] * { color: #fff !important; }
+a[data-testid="stBaseLinkButton-secondary"]:hover, a[data-testid="stBaseLinkButton-primary"]:hover {
+    background: __VINHO_MEDIO__ !important; border-color: __VINHO_MEDIO__ !important; box-shadow: 0 4px 12px rgba(106, 15, 43, .25);
+}
+
 /* Campos de seleção */
 [data-testid="stSelectbox"] [role="group"] {
     background: #fff !important; border: 1px solid __BORDA__ !important; border-radius: 10px !important;
@@ -418,6 +428,10 @@ body:has(section[data-testid="stSidebar"][aria-expanded="true"]) [data-testid="s
 [data-testid="stColumn"]:has([class*="st-key-cartao_"]) > [data-testid="stVerticalBlock"],
 [data-testid="stColumn"]:has([class*="st-key-cartao_"]) [data-testid="stElementContainer"]:has([class*="st-key-cartao_"]) { height: 100%; }
 [class*="st-key-cartao_"] { height: 100%; }
+/* O wrapper do container também precisa esticar, senão o cartão mais curto fica menor */
+[data-testid="stColumn"]:has([class*="st-key-cartao_"]) > [data-testid="stVerticalBlock"] { display: flex; flex-direction: column; height: 100%; }
+[data-testid="stColumn"]:has([class*="st-key-cartao_"]) > [data-testid="stVerticalBlock"] > * { flex: 1 1 auto; display: flex; flex-direction: column; }
+[data-testid="stColumn"]:has([class*="st-key-cartao_"]) > [data-testid="stVerticalBlock"] > * > [class*="st-key-cartao_"] { flex: 1 1 auto; }
 [class*="st-key-cartao_"]:hover { box-shadow: 0 6px 20px rgba(74, 10, 30, .18); border-color: __DOURADO__; border-top-color: __DOURADO__; }
 [class*="st-key-cartao_"] .cartao-sigla {
     width: 46px; height: 46px; border-radius: 12px; display: flex; align-items: center; justify-content: center;
